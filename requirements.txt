@@ -1,0 +1,7 @@
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
+protobuf>=4.25.0
+aioquic>=0.9.21
+cryptography>=42.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0

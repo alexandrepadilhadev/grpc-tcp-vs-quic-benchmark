@@ -1,0 +1,9 @@
+docs/
+.github/
+
+__pycache__/
+# Runtime output and local credentials
+logs/
+certs/
+*.log
+.env

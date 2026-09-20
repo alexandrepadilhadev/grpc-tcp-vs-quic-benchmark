@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package payment;
+
+option go_package = "github.com/grpc-poc/api/payment";
+option java_multiple_files = true;
+option java_package = "com.grpc.poc.payment";
+
+service PaymentService {
+  // Unary RPC: Process a single payment transaction
+  rpc ProcessPayment (PaymentRequest) returns (PaymentResponse);
+
+  // Server-streaming RPC: Stream payment status updates
+  rpc StreamPaymentStatus (StreamStatusRequest) returns (stream PaymentStatusUpdate);
+}
+
+message PaymentRequest {
+  // Transaction amount in cents
+  int64 amount_cents = 1;
+
+  // Merchant identifier
+  string merchant_id = 2;
+
+  // Customer identifier
+  string customer_id = 3;
+
+  // Payment description
+  string description = 4;
+
+  // Currency code (ISO 4217)
+  string currency = 5;
+}
+
+message PaymentResponse {
+  // Authorization status
+  enum Status {
+    UNKNOWN = 0;
+    APPROVED = 1;
+    DECLINED = 2;
+    ERROR = 3;
+  }
+
+  Status status = 1;
+
+  // Unique transaction identifier
+  string transaction_id = 2;
+
+  // Status message
+  string message = 3;
+
+  // Response timestamp (Unix milliseconds)
+  int64 timestamp_ms = 4;
+}
+
+message StreamStatusRequest {
+  // Transaction identifier to monitor
+  string transaction_id = 1;
+}
+
+message PaymentStatusUpdate {
+  // Status enumeration
+  enum StatusCode {
+    PENDING = 0;
+    PROCESSING = 1;
+    AUTHORIZED = 2;
+    CAPTURED = 3;
+    SETTLED = 4;
+    FAILED = 5;
+  }
+
+  StatusCode status = 1;
+
+  // Current progress percentage (0-100)
+  int32 progress_percent = 2;
+
+  // Status description
+  string description = 3;
+
+  // Update timestamp (Unix milliseconds)
+  int64 timestamp_ms = 4;
+}
