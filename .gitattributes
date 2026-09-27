@@ -1,0 +1,6 @@
+# Normalize text files to LF (edited on Windows, executed on Linux).
+* text=auto eol=lf
+
+*.pdf binary
+*.png binary
+*.parquet binary
