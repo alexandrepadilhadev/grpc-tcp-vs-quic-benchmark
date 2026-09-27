@@ -1,0 +1,53 @@
+name: bench
+
+x-build: &build
+  context: ..
+  dockerfile: deploy/Dockerfile
+  args:
+    VERSION: ${VERSION:-dev}
+
+services:
+  server:
+    build:
+      <<: *build
+      target: server
+    image: bench-server:local
+    expose: ["8443/tcp", "8443/udp"]
+    environment:
+      TRANSPORT: ${TRANSPORT:-h2}
+      ADDR: ":8443"
+      TLS_CERT: /certs/server.crt
+      TLS_KEY: /certs/server.key
+      TLS_CA: /certs/ca.crt
+    cap_add: [NET_ADMIN]
+    cpuset: "${SERVER_CPUS:-2-3}"
+    volumes: ["../certs:/certs:ro"]
+    networks: [benchnet]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/server", "healthcheck"]
+      start_period: 10s
+      start_interval: 1s
+      interval: 60s
+      timeout: 3s
+      retries: 3
+
+  loadgen:
+    build:
+      <<: *build
+      target: loadgen
+    image: bench-loadgen:local
+    profiles: [load]
+    environment:
+      TRANSPORT: ${TRANSPORT:-h2}
+      TLS_CA: /certs/ca.crt
+    cap_add: [NET_ADMIN]
+    cpuset: "${LOADGEN_CPUS:-4-5}"
+    volumes: ["../certs:/certs:ro", "../results:/results"]
+    networks: [benchnet]
+    depends_on:
+      server:
+        condition: service_healthy
+
+networks:
+  benchnet:
+    driver: bridge
