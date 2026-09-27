@@ -82,7 +82,7 @@ flowchart LR
 | Disk | 60 GB dynamic VHDX | Images + results. |
 | Network | Default Switch (reach the VM at `<vm-name>.mshome.net`) or an External switch for a fixed IP | SSH from Windows and Internet access for Git/packages. |
 | Checkpoints | Automatic checkpoints off | Avoids disk I/O surprises. |
-| Ubuntu installer | Ubuntu Server (minimized not required), **Install OpenSSH server** checked, no extra snaps (no Docker snap) | Docker Engine comes from Docker's apt repo in `setup-vm.sh`. |
+| Ubuntu installer | Ubuntu 24.04 or 26.04 LTS (Server preferred; Desktop accepted, D19), **Install OpenSSH server** checked, no extra snaps (no Docker snap) | Docker Engine comes from Docker's apt repo in `setup-vm.sh`. |
 
 Post-install manual checks (before `setup-vm.sh` exists):
 

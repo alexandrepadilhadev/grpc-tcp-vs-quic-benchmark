@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Prepare an Ubuntu 24.04 VM as the Docker host for the benchmark. Idempotent.
+# Prepare an Ubuntu 24.04/26.04 VM as the Docker host for the benchmark. Idempotent.
 # Usage: bash scripts/setup-vm.sh [--check-only]
 set -euo pipefail
 
 readonly EXPECTED_OS_ID="ubuntu"
-readonly EXPECTED_OS_VERSION="24.04"
+readonly -a SUPPORTED_OS_VERSIONS=("24.04" "26.04")
 readonly PYTHON_VERSION="3.13"
 readonly UDP_BUFFER_BYTES=8388608 # 8 MiB
 readonly SYSCTL_FILE="/etc/sysctl.d/90-grpc-bench.conf"
@@ -53,6 +53,14 @@ parse_args() {
 
 # ------------------------------------------------------------------ preflight
 
+is_supported_os_version() {
+    local version
+    for version in "${SUPPORTED_OS_VERSIONS[@]}"; do
+        [[ "$1" == "${version}" ]] && return 0
+    done
+    return 1
+}
+
 preflight() {
     [[ ${EUID} -ne 0 ]] || die "run as a regular user with sudo privileges, not as root"
     command -v sudo >/dev/null 2>&1 || die "sudo not found"
@@ -60,8 +68,8 @@ preflight() {
 
     # shellcheck source=/dev/null
     . /etc/os-release
-    if [[ "${ID:-}" != "${EXPECTED_OS_ID}" || "${VERSION_ID:-}" != "${EXPECTED_OS_VERSION}" ]]; then
-        die "expected Ubuntu ${EXPECTED_OS_VERSION}, found ${PRETTY_NAME:-unknown}"
+    if [[ "${ID:-}" != "${EXPECTED_OS_ID}" ]] || ! is_supported_os_version "${VERSION_ID:-}"; then
+        die "expected Ubuntu ${SUPPORTED_OS_VERSIONS[*]}, found ${PRETTY_NAME:-unknown}"
     fi
 
     sudo -v || die "sudo authentication failed"
@@ -72,7 +80,7 @@ preflight() {
 install_base_packages() {
     log "Installing base packages"
     sudo apt-get update -y -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
         ca-certificates curl git make iproute2 ethtool openssl util-linux
 }
 
@@ -98,7 +106,7 @@ install_docker() {
             | sudo tee "${DOCKER_SOURCES}" >/dev/null
 
         sudo apt-get update -y -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         info "installed: $(sudo docker --version)"
     fi
@@ -119,7 +127,7 @@ ensure_netem() {
         local extra_pkg
         extra_pkg="linux-modules-extra-$(uname -r)"
         info "modprobe failed; installing ${extra_pkg}"
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${extra_pkg}" \
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${extra_pkg}" \
             || die "could not install ${extra_pkg}"
         sudo modprobe sch_netem || die "sch_netem still unavailable after installing ${extra_pkg}"
     fi
@@ -268,7 +276,7 @@ print_summary() {
     done
 
     if (( relogin_needed )); then
-        printf '\n    Log out and back in (or run: newgrp docker) to use docker without sudo.\n'
+        printf '\n    Log out and back in to use docker without sudo (newgrp is not available on 26.04).\n'
     fi
 
     if (( failures > 0 )); then

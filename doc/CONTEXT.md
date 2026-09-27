@@ -76,7 +76,7 @@ Two stages:
 | Load generator | Custom asyncio open-loop generator (`bench.loadgen`) | Replaces Locust/JMeter shown in proposal Fig. 5. |
 | Network emulation | Linux `tc` / `netem` | Applied per container interface on `grpc_net`. |
 | Orchestration | Docker Compose (base + target overlays) | Isolated virtual networks. |
-| Docker host | **Linux VM on Hyper-V** (Ubuntu Server 24.04 LTS, Docker Engine) | Repo cloned in the VM (D16). Docker Desktop WSL2 backend is unsupported: its kernel lacks `sch_netem`. |
+| Docker host | **Linux VM on Hyper-V** (Ubuntu 24.04 or 26.04 LTS, Docker Engine) | Repo cloned in the VM (D16). Current VM: Ubuntu 26.04 Desktop (D19). Docker Desktop WSL2 backend is unsupported: its kernel lacks `sch_netem`. |
 | Quality | `ruff` (lint + format), `mypy --strict`, `pytest`, `pytest-asyncio` | |
 | Analysis | `pandas`, `numpy`, `scipy`, `matplotlib` | `bench analyze` / `bench report`. |
 | Task runner | `Makefile` | Shortcuts over `uv run` and `bench`. |
@@ -358,6 +358,7 @@ Raw per-request records are stored (not only aggregates) so any statistic can be
 | D16 | 2026-09-27 | Repo cloned inside the Hyper-V VM; builds, tests and experiments run there. Sync via Git remote (manual push). | Avoids remote-Docker and bind-mount issues. |
 | D17 | 2026-09-27 | Plain `asyncio` event loop for both transports. | Simplicity and parity. |
 | D18 | 2026-09-27 | Report sanity thresholds: loss within ±20 % relative, CPU < 80 % of a core per process, CV of p50 < 10 %. | Detects invalid runs (impairment mismatch, saturation, noise). |
+| D19 | 2026-09-27 | Ubuntu 26.04 LTS accepted as Docker host (in addition to 24.04); `setup-vm.sh` supports both, including `sudo-rs`. | Author's VM runs Ubuntu 26.04 Desktop; Docker publishes packages for it and `sch_netem` ships with the kernel. |
 
 ---
 
@@ -368,6 +369,7 @@ Raw per-request records are stored (not only aggregates) so any statistic can be
 3. **Risk scoring blocking or not (stage 2):** proposed default non-blocking.
 4. **AMQP event encoding (stage 2):** JSON vs protobuf.
 5. **Loss placement (stage 2):** all `grpc_net` hops at once vs one hop at a time.
+6. **Desktop noise during batches:** the VM runs a GNOME session (~3.6 GiB used, 7.1 GiB total). Options: more VM memory, close apps, or boot to `multi-user.target` for experiment batches.
 
 ---
 
@@ -394,7 +396,9 @@ Raw per-request records are stored (not only aggregates) so any statistic can be
 
 - Repository: `README.md`, `LICENSE`, thesis PDF, this file and the POC plan. Branches: `main`, `develop`.
 - POC plan decisions confirmed (D15–D18).
-- Step 0.2 (`scripts/setup-vm.sh`) and step 1.1 (repo bootstrap) written; pending validation on the VM (`setup-vm.sh`, `make install check certs`).
+- Step 0.2 validated on the VM (Ubuntu 26.04, Docker 29.8.1, compose 5.5.1, `sch_netem` in container OK, UDP buffers 8 MiB, uv 0.12.19, Python 3.13.15, 6 vCPUs; memory 7.1 GiB WARN).
+- Step 1.1 validated: `make install check certs` green (aioquic 1.3.0, h2 4.4.1); `uv.lock` created.
+- Phase 0 exit criterion met: `tc qdisc add dev eth0 root netem loss 1%` succeeds inside an `alpine:3.20` container with `NET_ADMIN`.
 - Next step: step 1.2 (`echo.proto` + codegen), plan pending approval.
 
 ---

@@ -10,7 +10,7 @@ A distributed mock payment processing ecosystem designed to benchmark and compar
 
 ## Requirements
 
-- Docker host: **Ubuntu Server 24.04 LTS VM** (Hyper-V or similar) with Docker Engine.
+- Docker host: **Ubuntu 24.04 or 26.04 LTS VM** (Hyper-V or similar) with Docker Engine.
   Docker Desktop with the WSL2 backend is not supported: its kernel lacks `sch_netem`.
 - Python 3.13 and [`uv`](https://docs.astral.sh/uv/) (installed by the setup script).
 
@@ -21,7 +21,7 @@ git clone <repo-url> grpc-tcp-vs-quic-benchmark
 cd grpc-tcp-vs-quic-benchmark
 
 bash scripts/setup-vm.sh          # Docker, netem, UDP buffers, uv, Python
-# log out and back in (or: newgrp docker)
+# log out and back in (docker group)
 bash scripts/setup-vm.sh --check-only
 
 make install                      # create .venv and uv.lock
