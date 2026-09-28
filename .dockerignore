@@ -1,7 +1,8 @@
 .git
 .superpowers
 .venv
-analysis
+**/__pycache__
+**/.pytest_cache
 certs
 doc
 results

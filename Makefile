@@ -1,9 +1,10 @@
 COMPOSE   := docker compose -f deploy/compose.yaml
 VERSION   ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 TRANSPORT ?= h2
+REPS      ?= 5
 export VERSION TRANSPORT
 
-.PHONY: certs build test smoke down
+.PHONY: certs build test test-py smoke run-all analyze down
 
 certs:
 	bash scripts/gen-certs.sh
@@ -18,6 +19,16 @@ smoke:
 	$(COMPOSE) up -d --wait server
 	$(COMPOSE) run --rm loadgen --target=server:8443 --requests=1000 --warmup=0 --strict \
 		--out=/results/smoke/$(TRANSPORT)/requests.csv; rc=$$?; $(COMPOSE) down; exit $$rc
+
+run-all: build
+	REPS=$(REPS) bash scripts/run.sh
+
+analyze:
+	$(if $(RUN),,$(error usage: make analyze RUN=<run_id>))
+	$(COMPOSE) run --rm --build analysis /results/$(RUN)
+
+test-py:
+	$(COMPOSE) run --rm --build --entrypoint python analysis -m pytest
 
 down:
 	$(COMPOSE) --profile load down --remove-orphans
