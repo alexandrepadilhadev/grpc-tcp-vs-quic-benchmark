@@ -19,6 +19,7 @@ NS = 1_000_000_000
 KEYS = ["scenario", "transport"]
 QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
+COMPARE = ["p50", "p99", "p999", "error_rate", "recovery_s", "cpu_per_krps", "handshake_ms"]
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -80,6 +81,23 @@ def recovery_time(series, outage_start_ns, outage_end_ns, threshold=0.9, windows
     return None
 
 
+def degraded_s(series, rps, exclude=None, end_ns=None, threshold=0.9) -> float:
+    """Number of 1 s bins with ok throughput below threshold x rps, outside
+    exclude=(start_ns, stop_ns); NaN in closed loop (rps == 0). The first bin and
+    bins ending after end_ns (the last scheduled send) are partial and ignored.
+    In s1 and s5 a non-zero value points to host noise; with loss or jitter it
+    can also be the transport (retransmission stalls)."""
+    if not rps:
+        return np.nan
+    width = series.index[1] - series.index[0]
+    s = series.iloc[1:-1]
+    if end_ns is not None:
+        s = s[s.index + width <= end_ns]
+    if exclude is not None:
+        s = s[(s.index + width <= exclude[0]) | (s.index >= exclude[1])]
+    return float((s < threshold * rps).sum())
+
+
 def _mib(s: str) -> float:
     m = re.fullmatch(r"([\d.]+)\s*([KMGT]?i?B)", s.split("/")[0].strip())
     return float(m[1]) * MIB[m[2]] if m and m[2] in MIB else np.nan
@@ -116,6 +134,26 @@ def summarize(reps: pd.DataFrame) -> pd.DataFrame:
         if len(a) and len(b):
             out.loc[out.scenario == scenario, "mwu_p"] = stats.mannwhitneyu(a, b, alternative="two-sided").pvalue
     return out
+
+
+def comparison(reps: pd.DataFrame) -> pd.DataFrame:
+    """h3 vs h2 per scenario x metric: means, delta_pct = (h3 - h2) / h2 x 100 and the
+    two-sided Mann-Whitney U p over per-rep values; metrics missing on one side are dropped."""
+    rows = []
+    for scenario, g in reps.groupby("scenario", sort=True):
+        for m in COMPARE:
+            if m not in g:
+                continue
+            a, b = g[m][g.transport == "h2"].dropna(), g[m][g.transport == "h3"].dropna()
+            if a.empty or b.empty:
+                continue
+            rows.append({
+                "scenario": scenario, "metric": m, "h2_mean": a.mean(), "h3_mean": b.mean(),
+                "delta_pct": (b.mean() - a.mean()) / a.mean() * 100 if a.mean() else np.nan,
+                "mwu_p": stats.mannwhitneyu(a, b, alternative="two-sided").pvalue, "n_h2": len(a), "n_h3": len(b),
+            })
+    cols = ["scenario", "metric", "h2_mean", "h3_mean", "delta_pct", "mwu_p", "n_h2", "n_h3"]
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _container_stats(path, lo, hi) -> dict:
@@ -244,18 +282,22 @@ def _rep_row(d, name):
         _warn(f"{name}: no ok RPC, skipped")
         return None
     row = {("lat_" + k if k in ("mean", "std") else k): v for k, v in latency_stats(df).items()}
+    if "handshake_us" in meta:
+        row["handshake_ms"] = meta["handshake_us"] / 1000
     row.update(throughput(df))
     row["error_rate"] = error_rate(df)
     if (d / "stats.csv").exists():
         end = df.start_ns + df.latency_us * 1000
         row.update(_container_stats(d / "stats.csv", df.start_ns.min(), end.max()))
+        if "server_cpu" in row:
+            row["cpu_per_krps"] = row["server_cpu"] / (row["ok_rps"] / 1000)
     else:
         _warn(f"{name}: no stats.csv")
-    return row, df
+    return row, df, meta.get("load", {}).get("rps", 0)
 
 
 def main(argv: list[str]) -> int:
-    """analyze.py <run_dir> -> <run_dir>/analysis/{reps.csv,summary.csv,*.png}"""
+    """analyze.py <run_dir> -> <run_dir>/analysis/{reps,summary,comparison}.csv and *.png"""
     if len(argv) != 1:
         print("usage: analyze.py <run_dir>", file=sys.stderr)
         return 2
@@ -272,7 +314,8 @@ def main(argv: list[str]) -> int:
         got = _rep_row(d, name)
         if got is None:
             continue
-        row, df = got
+        row, df, rps = got
+        s, exclude = throughput_series(df), None
         if (d / "events.csv").exists():
             ev = pd.read_csv(d / "events.csv").set_index("event").ts_ns
             s = throughput_series(df, origin=ev.outage_end)
@@ -280,7 +323,11 @@ def main(argv: list[str]) -> int:
             if rec is None:
                 _warn(f"{name}: throughput never recovered")
             row["recovery_s"] = np.nan if rec is None else rec
+            exclude = (ev.outage_start, math.inf if rec is None else ev.outage_end + rec * NS)
             series.append((transport, s, ev.outage_start, ev.outage_end))
+        row["degraded_s"] = degraded_s(s, rps, exclude, end_ns=df.start_ns.max())
+        if row["degraded_s"] > 0:
+            _warn(f"{name}: degraded_s={row['degraded_s']:.0f} (1 s bins below 90% of --rps={rps}, outage excluded)")
         curves.setdefault((scenario, transport), []).append(np.percentile(df.latency_us[df.status == "ok"], QUANTILES))
         rows.append({"scenario": scenario, "transport": transport, "rep": int(d.name.removeprefix("rep-")), **row})
     if not rows:
@@ -292,6 +339,7 @@ def main(argv: list[str]) -> int:
     reps = pd.DataFrame(rows)
     reps.to_csv(out / "reps.csv", index=False)
     summarize(reps).to_csv(out / "summary.csv", index=False)
+    comparison(reps).to_csv(out / "comparison.csv", index=False)
     plot_cdf(curves, out / "latency_cdf.png")
     plot_p99(reps, out / "p99_boxplot.png")
     if series:

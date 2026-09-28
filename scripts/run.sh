@@ -61,14 +61,16 @@ matrix() {
 	local reps=${REPS:-5}
 	[[ $reps =~ ^[1-9][0-9]*$ ]] || die "REPS must be a positive integer, got '$reps'"
 	[[ -f certs/server.crt ]] || die "certs/server.crt missing: run make certs"
+	mkdir -p results
+	[[ -w results ]] || die "results/ not writable: sudo chown -R $USER: results"
 	local rmem
 	rmem=$(sysctl -n net.core.rmem_max)
 	((rmem >= 7500000)) || echo "warning: net.core.rmem_max=$rmem < 7500000; run: sudo bash scripts/host-tuning.sh" >&2
 
 	local run_id root
-	run_id=$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)
+	run_id=$(date +%Y-%m-%d-%H-%M-%S) # VM local time; the commit is in meta.json
 	root=results/$run_id
-	mkdir -p "$root"
+	mkdir "$root" || die "$root already exists (results are immutable)"
 
 	local env scenario r t order
 	for env in experiments/scenarios/${SCENARIOS:-*}.env; do

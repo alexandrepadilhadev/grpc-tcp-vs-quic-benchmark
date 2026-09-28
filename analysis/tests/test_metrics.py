@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 import pandas as pd
 import pytest
 
@@ -107,6 +109,39 @@ def test_summarize():
     assert list(s.mwu_p) == pytest.approx([0.1, 0.1])  # exact two-sided: 2 / C(6, 3)
 
 
+def test_degraded_s():
+    s = pd.Series([100, 100, 50, 100], index=[i * S for i in range(4)])  # edge bins are ignored
+    assert analyze.degraded_s(s, 100) == 1
+    assert analyze.degraded_s(s, 100, exclude=(2 * S, 3 * S)) == 0
+    assert math.isnan(analyze.degraded_s(s, 0))  # closed loop: no target rate
+
+
+def test_degraded_s_ignores_bins_after_last_send():
+    # clean 100 rps for 5 s; the last RPC hits a 2 s deadline, so bins 5-6 hold only its tail
+    rows = [(i, 0, i * 10_000_000, 1000, "ok", 1, 1, "measure") for i in range(499)]
+    rows.append((499, 0, 4_990_000_000, 2_000_000, "deadline_exceeded", 1, 0, "measure"))
+    df = frame(rows)
+    assert analyze.degraded_s(analyze.throughput_series(df), 100, end_ns=df.start_ns.max()) == 0
+
+
+def test_comparison():
+    reps = pd.DataFrame(
+        {
+            "scenario": ["s2"] * 6,
+            "transport": ["h2"] * 3 + ["h3"] * 3,
+            "rep": [1, 2, 3] * 2,
+            "p99": [10.0, 12.0, 14.0, 7.0, 8.0, 9.0],
+            "recovery_s": [np.nan] * 6,
+        }
+    )
+    c = analyze.comparison(reps)
+    assert list(c.metric) == ["p99"]  # all-NaN metrics are dropped
+    r = c.iloc[0]
+    assert (r.h2_mean, r.h3_mean, r.n_h2, r.n_h3) == (12.0, 8.0, 3, 3)
+    assert r.delta_pct == pytest.approx(-33.333, rel=1e-4)
+    assert r.mwu_p == pytest.approx(0.1)
+
+
 def write_rep(d, transport, outage=None, n=500, dials=1):
     """100 rps for n/100 s; requests started inside outage=(start_s, end_s) fail."""
     d.mkdir(parents=True)
@@ -118,7 +153,10 @@ def write_rep(d, transport, outage=None, n=500, dials=1):
         status, lat = ("unavailable", 1000) if down else ("ok", 1000 + i)
         lines.append(f"{i},0,{start},{lat},{status},100,100,measure\n")
     (d / "requests.csv").write_text("".join(lines))
-    (d / "meta.json").write_text(f'{{"transport": "{transport}", "dials": {dials}, "interrupted": false}}')
+    (d / "meta.json").write_text(
+        f'{{"transport": "{transport}", "dials": {dials}, "interrupted": false,'
+        f' "handshake_us": 4000, "load": {{"rps": 100}}}}'
+    )
     (d / "stats.csv").write_text(  # the idle sample before the measured window is ignored
         "ts_ns,name,cpu_perc,mem_usage\n"
         f"{t0 - S},bench-server-1,0%,0MiB / 1GiB\n{t0 - S},bench-loadgen,0%,0MiB / 1GiB\n"
@@ -150,6 +188,15 @@ def test_main(tmp_path):
     assert s.loc[("s1-baseline", "h3"), "loadgen_mem_mib_mean"] == pytest.approx(20.0)
     assert s.loc[("s5-outage", "h2"), "recovery_s_mean"] == pytest.approx(0.0)
     assert s.loc[("s5-outage", "h2"), "error_rate_mean"] == pytest.approx(0.2)
+    assert s.loc[("s1-baseline", "h3"), "handshake_ms_mean"] == pytest.approx(4.0)
+    krps = s.loc[("s1-baseline", "h3"), "ok_rps_mean"] / 1000  # ~0.1
+    assert s.loc[("s1-baseline", "h3"), "cpu_per_krps_mean"] == pytest.approx(10 / krps)  # server at 10%
+    assert s.loc[("s1-baseline", "h3"), "degraded_s_mean"] == 0
+    assert s.loc[("s5-outage", "h2"), "degraded_s_mean"] == 0  # the outage window does not count
+    c = pd.read_csv(out / "comparison.csv")
+    assert set(c.scenario) == {"s1-baseline", "s5-outage"}
+    assert "recovery_s" in set(c.metric[c.scenario == "s5-outage"])
+    assert "recovery_s" not in set(c.metric[c.scenario == "s1-baseline"])
     for png in ["latency_cdf.png", "p99_boxplot.png", "s5_throughput.png"]:
         assert (out / png).stat().st_size > 0
 

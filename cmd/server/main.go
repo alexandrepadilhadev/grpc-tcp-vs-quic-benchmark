@@ -18,6 +18,7 @@ import (
 
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/bench/v1/benchv1connect"
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/benchsvc"
+	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/rpclog"
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/transport"
 )
 
@@ -40,15 +41,26 @@ func run(ctx context.Context, args []string) error {
 	cfg := transport.DefaultConfig()
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	cfg.RegisterFlags(fs, transport.RoleServer|transport.RoleClient)
+	level := slog.LevelInfo
+	var levelErr error
+	if v, ok := os.LookupEnv("LOG_LEVEL"); ok {
+		if err := level.UnmarshalText([]byte(v)); err != nil {
+			levelErr = fmt.Errorf("env LOG_LEVEL: %w", err)
+		}
+	}
+	fs.TextVar(&level, "log-level", level, "debug|info|warn|error; debug logs every RPC [LOG_LEVEL]")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if levelErr != nil && !isSet(fs, "log-level") {
+		return levelErr
 	}
 	if probe {
 		return healthcheck(ctx, cfg)
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	srv, err := transport.Listen(cfg, newMux(), log)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	srv, err := transport.Listen(cfg, newMux(log), log)
 	if err != nil {
 		return err
 	}
@@ -58,18 +70,26 @@ func run(ctx context.Context, args []string) error {
 		"addr", srv.Addr().String(),
 		"max_streams", cfg.MaxConcurrentStreams,
 		"handshake_timeout", cfg.HandshakeTimeout.String(),
-		"idle_timeout", cfg.IdleTimeout.String())
+		"idle_timeout", cfg.IdleTimeout.String(),
+		"log_level", level.String())
 	err = srv.Serve(ctx)
 	log.Info("server stopped", "error", err)
 	return err
 }
 
-func newMux() http.Handler {
+// newMux serves BenchService, with per-RPC lines at rpclog.Level, and /healthz.
+func newMux(log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// nil constructors unregister gzip: no compression in the measured path
-	mux.Handle(benchv1connect.NewBenchServiceHandler(benchsvc.New(), connect.WithCompression("gzip", nil, nil)))
+	mux.Handle(benchv1connect.NewBenchServiceHandler(benchsvc.New(),
+		connect.WithCompression("gzip", nil, nil), connect.WithInterceptors(rpclog.Interceptor(log))))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
 	return mux
+}
+
+func isSet(fs *flag.FlagSet, name string) (set bool) {
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
 }
 
 // healthcheck GETs /healthz on cfg.Addr over the configured transport.

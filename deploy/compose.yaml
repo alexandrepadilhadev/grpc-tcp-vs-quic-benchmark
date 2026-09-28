@@ -26,6 +26,7 @@ services:
       TLS_CERT: /certs/server.crt
       TLS_KEY: /certs/server.key
       TLS_CA: /certs/ca.crt
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     cap_add: [NET_ADMIN]
     cpuset: "${SERVER_CPUS:-2-3}"
     volumes: ["../certs:/certs:ro"]
