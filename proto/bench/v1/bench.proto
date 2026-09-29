@@ -1,0 +1,16 @@
+syntax = "proto3";
+package bench.v1;
+
+service BenchService {
+  rpc Unary(UnaryRequest) returns (UnaryResponse);
+}
+
+message UnaryRequest {
+  bytes  payload          = 1; // request body of configurable size
+  uint32 response_size    = 2; // bytes requested in the response
+  uint32 server_delay_us  = 3; // simulated processing delay
+}
+
+message UnaryResponse {
+  bytes payload = 1;
+}

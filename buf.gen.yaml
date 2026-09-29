@@ -1,0 +1,14 @@
+version: v2
+clean: true
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen
+plugins:
+  - local: [go, tool, -modfile=tools/go.mod, protoc-gen-go]
+    out: gen
+    opt: paths=source_relative
+  - local: [go, tool, -modfile=tools/go.mod, protoc-gen-connect-go]
+    out: gen
+    opt: paths=source_relative
