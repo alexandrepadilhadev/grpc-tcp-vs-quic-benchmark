@@ -25,10 +25,12 @@ run-all: build
 	mkdir -p results
 	REPS=$(REPS) bash scripts/run.sh
 
+# RUN="<run_id> ..." pools runs (OUT=<dir under results/> required); EXCLUDE=<scenario>,... drops degraded reps
 analyze:
-	$(if $(RUN),,$(error usage: make analyze RUN=<run_id>))
+	$(if $(RUN),,$(error usage: make analyze RUN="<run_id> ..." [OUT=<dir>] [EXCLUDE=<scenario>,...]))
 	mkdir -p results
-	$(COMPOSE) run --rm --build analysis /results/$(RUN)
+	$(COMPOSE) run --rm --build analysis $(addprefix /results/,$(RUN)) \
+		$(if $(OUT),--out=/results/$(OUT)) $(if $(EXCLUDE),--exclude-degraded=$(EXCLUDE))
 
 test-py:
 	$(COMPOSE) run --rm --build --entrypoint python analysis -m pytest

@@ -1,5 +1,6 @@
 """Analysis of results/<run_id>/ (spec §6.5)."""
 
+import argparse
 import json
 import math
 import re
@@ -17,9 +18,13 @@ from scipy import stats  # noqa: E402
 
 NS = 1_000_000_000
 KEYS = ["scenario", "transport"]
+ID = ["run", "rep", "excluded"]  # reps.csv columns that are not metrics
 QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
-COMPARE = ["p50", "p99", "p999", "error_rate", "served_frac","recovery_s", "cpu_per_krps", "handshake_ms"]
+COMPARE = [
+    "p50", "p99", "p999", "p50_all", "p99_all", "p999_all", "error_rate", "ok_rps", "served_frac", "recovery_s", "cpu_per_krps", "handshake_ms",
+]
+RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -35,6 +40,16 @@ def latency_stats(df) -> dict:
     lat = df.latency_us[df.status == "ok"].to_numpy(dtype=float)
     p50, p90, p99, p999 = np.percentile(lat, [50, 90, 99, 99.9])
     return {"p50": p50, "p90": p90, "p99": p99, "p999": p999, "mean": lat.mean(), "std": lat.std(ddof=1)}
+
+
+def latency_all(df, unsent, deadline_us) -> dict:
+    """Percentiles in us over every scheduled measure slot (no survivorship bias): ok RPCs at
+    their latency, failed RPCs at max(latency, deadline) and unsent slots at the deadline.
+    Like p*, only meaningful without saturation (served_frac ~ 1): the unsent count low."""
+    lat = np.where(df.status == "ok", df.latency_us, np.maximum(df.latency_us, deadline_us)).astype(float)
+    lat = np.concatenate([lat, np.full(int(unsent), float(deadline_us))])
+    p50, p99, p999 = np.percentile(lat, [50, 99, 99.9])
+    return {"p50_all": p50, "p99_all": p99, "p999_all": p999}
 
 
 def _window_s(df) -> float:
@@ -121,10 +136,78 @@ def parse_stats(path) -> pd.DataFrame:
     return df.drop(columns="mem_usage")
 
 
+def _order_ci(n, cdf, level=0.95):
+    """1-based rank k of the narrowest symmetric interval [x(k), x(n+1-k)] over n sorted
+    values covering >= level, where cdf(j) = P(rank statistic <= j) under the null, and its
+    coverage 1 - 2 cdf(k - 1); the full range (k = 1) when no interval reaches level."""
+    k = 1
+    while k < n // 2 and 1 - 2 * cdf(k) >= level:
+        k += 1
+    return k, 1 - 2 * cdf(k - 1)
+
+
+def median_ci(values) -> tuple:
+    """Median and distribution-free CI from order statistics (Binomial(n, 0.5)):
+    (median, lo, hi, level); the CI is NaN with fewer than 2 values."""
+    x = np.sort(np.asarray(values, dtype=float))
+    if len(x) < 2:
+        return (x[0] if len(x) else np.nan), np.nan, np.nan, np.nan
+    k, level = _order_ci(len(x), lambda j: stats.binom.cdf(j, len(x), 0.5))
+    return np.median(x), x[k - 1], x[-k], level
+
+
+def _u_cdf(n1, n2) -> np.ndarray:
+    """Exact null CDF of the Mann-Whitney U for n1 x n2 values without ties: the counts
+    are the coefficients of the Gaussian binomial [n1 + n2 choose n2] in q."""
+    c = [1] + [0] * (n1 * n2)
+    for i in range(1, n2 + 1):  # c *= (1 - q^(n1 + i)) / (1 - q^i)
+        for j in range(n1 * n2, n1 + i - 1, -1):
+            c[j] -= c[j - n1 - i]
+        for j in range(i, n1 * n2 + 1):
+            c[j] += c[j - i]
+    return np.cumsum(c) / math.comb(n1 + n2, n2)
+
+
+def hodges_lehmann(a, b) -> tuple:
+    """Hodges-Lehmann shift of b over a (median of all pairwise b - a) and its exact CI
+    from the U distribution: (shift, lo, hi, level); the CI is NaN with a group below 2."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    d = np.sort((b[:, None] - a[None, :]).ravel())
+    if min(len(a), len(b)) < 2:
+        return np.median(d), np.nan, np.nan, np.nan
+    cdf = _u_cdf(len(a), len(b))
+    k, level = _order_ci(len(d), lambda j: cdf[j])
+    return np.median(d), d[k - 1], d[-k], level
+
+
+def cliff_magnitude(d) -> str:
+    """Romano et al. (2006) thresholds for |Cliff's delta|."""
+    d = abs(d)
+    return "negligible" if d < 0.147 else "small" if d < 0.33 else "medium" if d < 0.474 else "large"
+
+
+def cliff_delta(a, b) -> tuple:
+    """Cliff's delta of b over a, (#b > a - #b < a) / (n_a x n_b) in [-1, 1], and its magnitude."""
+    diff = np.asarray(b, dtype=float)[:, None] - np.asarray(a, dtype=float)[None, :]
+    d = float(np.sign(diff).mean())
+    return d, cliff_magnitude(d)
+
+
+def holm(p) -> np.ndarray:
+    """Holm-Bonferroni adjusted p-values; NaN stays NaN and is not counted in the family."""
+    p = np.asarray(p, dtype=float)
+    out = np.full(len(p), np.nan)
+    idx = np.flatnonzero(~np.isnan(p))
+    order = idx[np.argsort(p[idx])]
+    m = len(order)
+    out[order] = np.minimum(1, np.maximum.accumulate(p[order] * (m - np.arange(m))))
+    return out
+
+
 def summarize(reps: pd.DataFrame) -> pd.DataFrame:
     """One row per scenario x transport: n, <metric>_mean, <metric>_ci95 (Student t),
     cv_p50 and mwu_p (two-sided Mann-Whitney U, h2 vs h3, over per-rep p99)."""
-    metrics = [c for c in reps.columns if c not in KEYS + ["rep"]]
+    metrics = [c for c in reps.columns if c not in KEYS + ID]
     rows = []
     for (scenario, transport), g in reps.groupby(KEYS, sort=True):
         row = {"scenario": scenario, "transport": transport, "n": len(g)}
@@ -134,6 +217,8 @@ def summarize(reps: pd.DataFrame) -> pd.DataFrame:
             row[f"{m}_ci95"] = (
                 stats.t.ppf(0.975, len(v) - 1) * v.std(ddof=1) / math.sqrt(len(v)) if len(v) > 1 else np.nan
             )
+            ci = median_ci(v)
+            row[f"{m}_median"], row[f"{m}_med_lo"], row[f"{m}_med_hi"], row[f"{m}_med_level"] = ci
         row["cv_p50"] = g.p50.std(ddof=1) / g.p50.mean()
         rows.append(row)
     out = pd.DataFrame(rows)
@@ -146,8 +231,11 @@ def summarize(reps: pd.DataFrame) -> pd.DataFrame:
 
 
 def comparison(reps: pd.DataFrame) -> pd.DataFrame:
-    """h3 vs h2 per scenario x metric: means, delta_pct = (h3 - h2) / h2 x 100 and the
-    two-sided Mann-Whitney U p over per-rep values; metrics missing on one side are dropped."""
+    """h3 vs h2 per scenario x metric: means, delta_pct = (h3 - h2) / h2 x 100, the
+    two-sided Mann-Whitney U p over per-rep values (raw and Holm-adjusted within the
+    scenario), medians, Hodges-Lehmann shift with CI and Cliff's delta; for RATIO metrics,
+    the h3/h2 ratio with CI (Hodges-Lehmann over log values). Metrics missing on one side
+    are dropped."""
     rows = []
     for scenario, g in reps.groupby("scenario", sort=True):
         for m in COMPARE:
@@ -156,13 +244,30 @@ def comparison(reps: pd.DataFrame) -> pd.DataFrame:
             a, b = g[m][g.transport == "h2"].dropna(), g[m][g.transport == "h3"].dropna()
             if a.empty or b.empty:
                 continue
+            shift, lo, hi, level = hodges_lehmann(a, b)
+            cd, mag = cliff_delta(a, b)
+            ratio = (np.nan,) * 3
+            if m in RATIO:
+                if (a > 0).all() and (b > 0).all():
+                    ratio = tuple(np.exp(hodges_lehmann(np.log(a), np.log(b))[:3]))
+                else:
+                    _warn(f"{scenario}/{m}: value <= 0, no h3/h2 ratio")
             rows.append({
                 "scenario": scenario, "metric": m, "h2_mean": a.mean(), "h3_mean": b.mean(),
                 "delta_pct": (b.mean() - a.mean()) / a.mean() * 100 if a.mean() else np.nan,
                 "mwu_p": stats.mannwhitneyu(a, b, alternative="two-sided").pvalue, "n_h2": len(a), "n_h3": len(b),
+                "h2_median": a.median(), "h3_median": b.median(),
+                "hl_shift": shift, "hl_lo": lo, "hl_hi": hi, "hl_level": level, "cliff_delta": cd, "cliff_mag": mag,
+                "ratio": ratio[0], "ratio_lo": ratio[1], "ratio_hi": ratio[2],
             })
-    cols = ["scenario", "metric", "h2_mean", "h3_mean", "delta_pct", "mwu_p", "n_h2", "n_h3"]
-    return pd.DataFrame(rows, columns=cols)
+    cols = [
+        "scenario", "metric", "h2_mean", "h3_mean", "delta_pct", "mwu_p", "mwu_p_holm", "n_h2", "n_h3",
+        "h2_median", "h3_median", "hl_shift", "hl_lo", "hl_hi", "hl_level", "cliff_delta", "cliff_mag",
+        "ratio", "ratio_lo", "ratio_hi",
+    ]
+    out = pd.DataFrame(rows, columns=cols)
+    out["mwu_p_holm"] = out.groupby("scenario").mwu_p.transform(holm)  # one family per scenario
+    return out
 
 
 def _container_stats(path, lo, hi) -> dict:
@@ -291,6 +396,9 @@ def _rep_row(d, name):
         _warn(f"{name}: no ok RPC, skipped")
         return None
     row = {("lat_" + k if k in ("mean", "std") else k): v for k, v in latency_stats(df).items()}
+    if "deadline_ns" not in meta.get("load", {}):
+        raise ValueError(f"{name}: meta.json has no load.deadline_ns, needed for p*_all")
+    row.update(latency_all(df, meta.get("unsent", 0), meta["load"]["deadline_ns"] / 1000))
     if "handshake_us" in meta:
         row["handshake_ms"] = meta["handshake_us"] / 1000
     row.update(throughput(df))
@@ -303,18 +411,14 @@ def _rep_row(d, name):
             row["cpu_per_krps"] = row["server_cpu"] / (row["ok_rps"] / 1000)
     else:
         _warn(f"{name}: no stats.csv")
-    return row, df, meta.get("load", {}).get("rps", 0)
+    return row, df, meta
 
 
-def main(argv: list[str]) -> int:
-    """analyze.py <run_dir> -> <run_dir>/analysis/{reps,summary,comparison}.csv and *.png"""
-    if len(argv) != 1:
-        print("usage: analyze.py <run_dir>", file=sys.stderr)
-        return 2
-    run = Path(argv[0])
+def _scan(run):
+    """Valid reps of one run dir as (row, latency quantiles, s5 series entry or None, meta)."""
     log = run / "failures.log"
     failed = {tuple(line.split(",")) for line in log.read_text().split()} if log.exists() else set()
-    rows, curves, series = [], {}, []
+    found = []
     for d in sorted(run.glob("*/*/rep-*")):
         scenario, transport = d.parts[-3], d.parts[-2]
         name = f"{scenario}/{transport}/{d.name}"
@@ -324,8 +428,9 @@ def main(argv: list[str]) -> int:
         got = _rep_row(d, name)
         if got is None:
             continue
-        row, df, rps = got
-        s, exclude = throughput_series(df), None
+        row, df, meta = got
+        rps = meta.get("load", {}).get("rps", 0)
+        s, exclude, entry = throughput_series(df), None, None
         if (d / "events.csv").exists():
             ev = pd.read_csv(d / "events.csv").set_index("event").ts_ns
             s = throughput_series(df, origin=ev.outage_end)
@@ -334,24 +439,84 @@ def main(argv: list[str]) -> int:
                 _warn(f"{name}: throughput never recovered")
             row["recovery_s"] = np.nan if rec is None else rec
             exclude = (ev.outage_start, math.inf if rec is None else ev.outage_end + rec * NS)
-            series.append((transport, s, ev.outage_start, ev.outage_end))
+            entry = (transport, s, ev.outage_start, ev.outage_end)
         row["degraded_s"] = degraded_s(s, rps, exclude, end_ns=df.start_ns.max())
         if row["degraded_s"] > 0:
             _warn(f"{name}: degraded_s={row['degraded_s']:.0f} (1 s bins below 90% of --rps={rps}, outage excluded)")
-        curves.setdefault((scenario, transport), []).append(np.percentile(df.latency_us[df.status == "ok"], QUANTILES))
-        rows.append({"scenario": scenario, "transport": transport, "rep": int(d.name.removeprefix("rep-")), **row})
-    if not rows:
-        _warn(f"no valid repetitions under {run}")
-        return 1
+        curve = np.percentile(df.latency_us[df.status == "ok"], QUANTILES)
+        rep = int(d.name.removeprefix("rep-"))
+        row = {"run": run.name, "scenario": scenario, "transport": transport, "rep": rep, **row}
+        found.append((row, curve, entry, meta))
+    return found
 
-    out = run / "analysis"
-    out.mkdir(exist_ok=True)
-    reps = pd.DataFrame(rows)
+
+def _args(argv):
+    p = argparse.ArgumentParser(prog="analyze.py", description="Analyze one or more results/<run_id>/ dirs.")
+    p.add_argument("runs", type=Path, nargs="+", metavar="run", help="run dir(s); reps of the same scenario are pooled")
+    p.add_argument("--out", type=Path, help="output dir (default <run>/analysis; required with several runs)")
+    p.add_argument(
+        "--exclude-degraded", default="", metavar="SCENARIO,...",
+        help="drop reps with degraded_s > 0 in these scenarios (host noise; only without injected loss or jitter)",
+    )
+    try:
+        args = p.parse_args(argv)
+        if len(args.runs) > 1 and args.out is None:
+            p.error("--out is required with several runs")
+    except SystemExit:
+        return None
+    return args
+
+
+def _check_runs(found):
+    """Warn when runs pooled for the same scenario differ in load config or commit."""
+    seen = {}
+    for row, _, _, meta in found:
+        s = seen.setdefault(row["scenario"], {"load": set(), "commit": set()})
+        s["load"].add(json.dumps(meta.get("load"), sort_keys=True))
+        s["commit"].add(meta.get("version"))
+    for scenario, s in seen.items():
+        for what, values in s.items():
+            if len(values) > 1:
+                _warn(f"{scenario}: {what} differs between runs")
+
+
+def main(argv: list[str]) -> int:
+    """analyze.py <run_dir>... [--out DIR] [--exclude-degraded=...] -> {reps,summary,comparison}.csv and *.png"""
+    args = _args(argv)
+    if args is None:
+        return 2
+    try:
+        found = [x for run in args.runs for x in _scan(run)]
+    except ValueError as e:
+        _warn(str(e))
+        return 1
+    if not found:
+        _warn(f"no valid repetitions under {' '.join(map(str, args.runs))}")
+        return 1
+    _check_runs(found)
+
+    reps = pd.DataFrame([row for row, _, _, _ in found])
+    noisy = {s for s in args.exclude_degraded.split(",") if s}
+    reps["excluded"] = reps.scenario.isin(noisy) & (reps.degraded_s > 0)
+    n_excluded = reps.groupby(KEYS).excluded.sum()
+    for (scenario, transport), n in n_excluded[n_excluded > 0].items():
+        _warn(f"{scenario}/{transport}: {n} rep(s) excluded (degraded_s > 0)")
+    kept = reps[~reps.excluded]
+    curves, series = {}, []
+    for (row, curve, entry, _), excluded in zip(found, reps.excluded):
+        if not excluded:
+            curves.setdefault((row["scenario"], row["transport"]), []).append(curve)
+            series += [entry] if entry else []
+
+    out = args.out or args.runs[0] / "analysis"
+    out.mkdir(parents=True, exist_ok=True)
     reps.to_csv(out / "reps.csv", index=False)
-    summarize(reps).to_csv(out / "summary.csv", index=False)
-    comparison(reps).to_csv(out / "comparison.csv", index=False)
+    summary = summarize(kept)
+    summary.insert(3, "n_excluded", [n_excluded[k] for k in zip(summary.scenario, summary.transport)])
+    summary.to_csv(out / "summary.csv", index=False)
+    comparison(kept).to_csv(out / "comparison.csv", index=False)
     plot_cdf(curves, out / "latency_cdf.png")
-    plot_p99(reps, out / "p99_boxplot.png")
+    plot_p99(kept, out / "p99_boxplot.png")
     if series:
         plot_outage(series, out / "s5_throughput.png")
     print(f"analyze: {len(reps)} reps -> {out}")
