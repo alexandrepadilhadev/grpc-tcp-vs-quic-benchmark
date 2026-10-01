@@ -51,8 +51,8 @@ type Result struct {
 	Start, End time.Time
 	Total, OK  int64
 	Errors     map[string]int64 // status -> count
-	LateStarts int64            // RPS mode: sent > 1ms after schedule
-	Unsent     int64            // RPS mode: slots due before end but never sent
+	LateStarts int64            // RPS mode: measure slots sent > 1ms after schedule
+	Unsent     int64            // RPS mode: measure slots due before end but never sent
 }
 
 type runner struct {
@@ -87,7 +87,7 @@ func Run(ctx context.Context, cfg Config, call Call, rec *Recorder) Result {
 		for w := range cfg.Concurrency {
 			wg.Go(func() {
 				for tk := range jobs {
-					if time.Since(tk) > lateThreshold {
+					if r.phase(tk) == PhaseMeasure && time.Since(tk) > lateThreshold {
 						r.late.Add(1)
 					}
 					r.do(ctx, w, tk)
@@ -144,16 +144,22 @@ func (r *runner) pace(ctx context.Context, jobs chan<- time.Time, end time.Time)
 			return 0
 		case <-endC:
 			timer.Stop()
-			return r.due(end, interval) - int64(k)
+			return r.unsent(k, end, interval)
 		}
 		select {
 		case jobs <- tk:
 		case <-ctx.Done():
 			return 0
 		case <-endC:
-			return r.due(end, interval) - int64(k)
+			return r.unsent(k, end, interval)
 		}
 	}
+}
+
+// unsent is the number of measure slots from k on scheduled before end;
+// warm-up slots left when the window ends are not counted.
+func (r *runner) unsent(k int, end time.Time, interval time.Duration) int64 {
+	return r.due(end, interval) - max(int64(k), r.due(r.warmEnd, interval))
 }
 
 // due is the number of slots scheduled before end.

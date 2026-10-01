@@ -141,6 +141,37 @@ func TestCOCorrection(t *testing.T) {
 	}
 }
 
+func TestUnsentCountsMeasureSlotsOnly(t *testing.T) {
+	cfg := base()
+	cfg.RPS, cfg.Concurrency = 100, 1
+	cfg.Warmup, cfg.Duration = 100*time.Millisecond, 100*time.Millisecond
+	// The only worker is stuck past the window, so the pacer never leaves the warm-up.
+	_, res := runRows(t, context.Background(), cfg, func(context.Context) (int, error) {
+		time.Sleep(300 * time.Millisecond)
+		return 10, nil
+	})
+	if res.Total != 0 || res.Unsent != 10 {
+		t.Fatalf("total=%d unsent=%d; want 0 and the 10 measure slots", res.Total, res.Unsent)
+	}
+}
+
+func TestLateStartsCountMeasureSlotsOnly(t *testing.T) {
+	cfg := base()
+	cfg.RPS, cfg.Concurrency = 100, 1
+	cfg.Warmup, cfg.Duration = 60*time.Millisecond, 50*time.Millisecond
+	var n atomic.Int64
+	// The first call makes warm-up slots 1-3 late; the pacer catches up before the measure phase.
+	_, res := runRows(t, context.Background(), cfg, func(context.Context) (int, error) {
+		if n.Add(1) == 1 {
+			time.Sleep(35 * time.Millisecond)
+		}
+		return 10, nil
+	})
+	if res.LateStarts != 0 || res.Total == 0 {
+		t.Fatalf("late=%d total=%d; want no late measure slot", res.LateStarts, res.Total)
+	}
+}
+
 func TestCancel(t *testing.T) {
 	cfg := base()
 	cfg.Duration = 10 * time.Second
