@@ -109,6 +109,15 @@ def test_summarize():
     assert list(s.mwu_p) == pytest.approx([0.1, 0.1])  # exact two-sided: 2 / C(6, 3)
 
 
+def test_served_frac():
+    meta = {"ok": 3000, "load": {"rps": 100, "duration_ns": 60 * S}}
+    assert analyze.served_frac(meta) == pytest.approx(0.5)
+
+
+def test_served_frac_closed_loop():
+    assert math.isnan(analyze.served_frac({"ok": 3000, "load": {"rps": 0, "duration_ns": 60 * S}}))
+
+
 def test_degraded_s():
     s = pd.Series([100, 100, 50, 100], index=[i * S for i in range(4)])  # edge bins are ignored
     assert analyze.degraded_s(s, 100) == 1
@@ -155,7 +164,7 @@ def write_rep(d, transport, outage=None, n=500, dials=1):
     (d / "requests.csv").write_text("".join(lines))
     (d / "meta.json").write_text(
         f'{{"transport": "{transport}", "dials": {dials}, "interrupted": false,'
-        f' "handshake_us": 4000, "load": {{"rps": 100}}}}'
+        f' "handshake_us": 4000, "ok": {n // 2}, "load": {{"rps": 100, "duration_ns": {n // 100 * S}}}}}'
     )
     (d / "stats.csv").write_text(  # the idle sample before the measured window is ignored
         "ts_ns,name,cpu_perc,mem_usage\n"
@@ -193,7 +202,9 @@ def test_main(tmp_path):
     assert s.loc[("s1-baseline", "h3"), "cpu_per_krps_mean"] == pytest.approx(10 / krps)  # server at 10%
     assert s.loc[("s1-baseline", "h3"), "degraded_s_mean"] == 0
     assert s.loc[("s5-outage", "h2"), "degraded_s_mean"] == 0  # the outage window does not count
+    assert s.loc[("s1-baseline", "h3"), "served_frac_mean"] == pytest.approx(0.5)  # meta ok = n / 2
     c = pd.read_csv(out / "comparison.csv")
+    assert "served_frac" in set(c.metric[c.scenario == "s1-baseline"])
     assert set(c.scenario) == {"s1-baseline", "s5-outage"}
     assert "recovery_s" in set(c.metric[c.scenario == "s5-outage"])
     assert "recovery_s" not in set(c.metric[c.scenario == "s1-baseline"])

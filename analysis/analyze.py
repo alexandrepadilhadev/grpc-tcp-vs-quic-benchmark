@@ -19,7 +19,7 @@ NS = 1_000_000_000
 KEYS = ["scenario", "transport"]
 QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
-COMPARE = ["p50", "p99", "p999", "error_rate", "recovery_s", "cpu_per_krps", "handshake_ms"]
+COMPARE = ["p50", "p99", "p999", "error_rate", "served_frac","recovery_s", "cpu_per_krps", "handshake_ms"]
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -51,6 +51,15 @@ def throughput(df) -> dict:
 
 def error_rate(df) -> float:
     return float((df.status != "ok").mean())
+
+
+def served_frac(meta) -> float:
+    """Fraction of the open-loop schedule (rps x duration) that ended ok, from meta.json;
+    slots the pacer never sent count as not served. NaN in closed loop (rps == 0)."""
+    load = meta.get("load", {})
+    if not load.get("rps"):
+        return np.nan
+    return meta["ok"] / (load["rps"] * load["duration_ns"] / NS)
 
 
 def throughput_series(df, bin_s=1.0, origin=None) -> pd.Series:
@@ -286,6 +295,7 @@ def _rep_row(d, name):
         row["handshake_ms"] = meta["handshake_us"] / 1000
     row.update(throughput(df))
     row["error_rate"] = error_rate(df)
+    row["served_frac"] = served_frac(meta)
     if (d / "stats.csv").exists():
         end = df.start_ns + df.latency_us * 1000
         row.update(_container_stats(d / "stats.csv", df.start_ns.min(), end.max()))
