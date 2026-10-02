@@ -57,6 +57,18 @@ rep() {
 	fi
 }
 
+# run_rep runs repetition r into <base>/rep-<r> in its own process. Handshake packets
+# lost under netem can outlast the probe deadline, so a probe failure is retried once;
+# the failed attempt is kept as <base>/probe-failed-rep-<r> (ignored by the analysis).
+run_rep() {
+	local env=$1 t=$2 base=$3 r=$4
+	bash scripts/run.sh rep "$env" "$t" "$base/rep-$r" && return 0
+	grep -q '"loadgen failed","error":"probe:' "$base/rep-$r/loadgen.log" 2>/dev/null || return 1
+	echo "!! rep-$r probe failed, retrying once" >&2
+	mv "$base/rep-$r" "$base/probe-failed-rep-$r"
+	bash scripts/run.sh rep "$env" "$t" "$base/rep-$r"
+}
+
 matrix() {
 	local reps=${REPS:-5}
 	[[ $reps =~ ^[1-9][0-9]*$ ]] || die "REPS must be a positive integer, got '$reps'"
@@ -81,7 +93,7 @@ matrix() {
 			((r % 2)) || order=(h3 h2)
 			for t in "${order[@]}"; do
 				echo "== $scenario $t rep-$r"
-				if ! bash scripts/run.sh rep "$env" "$t" "$root/$scenario/$t/rep-$r"; then
+				if ! run_rep "$env" "$t" "$root/$scenario/$t" "$r"; then
 					echo "$scenario,$t,$r" >>"$root/failures.log"
 					echo "!! $scenario $t rep-$r failed (see failures.log)" >&2
 				fi
