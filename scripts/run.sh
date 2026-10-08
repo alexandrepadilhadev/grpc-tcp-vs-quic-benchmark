@@ -2,7 +2,9 @@
 # Experiment runner (spec §6.4).
 #   bash scripts/run.sh                              every scenario x {h2,h3} x REPS
 #   bash scripts/run.sh rep <env> <transport> <dir>  one repetition (own process)
-# Env: SCENARIOS (glob over experiments/scenarios, default *), REPS (default 5).
+# Env: SCENARIOS (glob over experiments/scenarios, default *), REPS (default 5),
+# QLOG=1 (diagnostics only: qlog of both QUIC endpoints in <rep>/qlog/ and the
+# server's TCP counters in <rep>/nstat.txt; tracing costs CPU, do not use for measurements).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,6 +42,7 @@ rep() {
 	set +a
 	mkdir -p "$dir"
 	trap cleanup EXIT
+	[[ -z ${QLOG:-} ]] || export QLOGDIR=/results/${dir#results/}/qlog # path inside the containers
 
 	"${COMPOSE[@]}" up -d --wait server
 	sample_stats >"$dir/stats.csv" &
@@ -54,6 +57,9 @@ rep() {
 	if [[ -n $outage ]]; then
 		wait "$outage"
 		outage=
+	fi
+	if [[ -n ${QLOG:-} ]]; then
+		"${COMPOSE[@]}" exec -T server nstat -az >"$dir/nstat.txt" 2>&1 || true
 	fi
 }
 
