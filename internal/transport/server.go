@@ -76,6 +76,7 @@ func Listen(cfg Config, h http.Handler, log *slog.Logger) (*Server, error) {
 				MaxIncomingStreams:   int64(cfg.MaxConcurrentStreams),
 				MaxIdleTimeout:       cfg.IdleTimeout,
 				HandshakeIdleTimeout: cfg.HandshakeTimeout,
+				Tracer:               quicTracer(),
 			},
 			Logger: log,
 		}

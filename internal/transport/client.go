@@ -62,7 +62,7 @@ func NewClient(cfg Config) (*Client, error) {
 		// QUIC requires ALPN, so a mismatch cannot pass the handshake; only count dials.
 		tr := &http3.Transport{
 			TLSClientConfig:    tlsCfg,
-			QUICConfig:         &quic.Config{HandshakeIdleTimeout: cfg.HandshakeTimeout, MaxIdleTimeout: cfg.IdleTimeout},
+			QUICConfig:         &quic.Config{HandshakeIdleTimeout: cfg.HandshakeTimeout, MaxIdleTimeout: cfg.IdleTimeout, Tracer: quicTracer()},
 			DisableCompression: true,
 			Dial: func(ctx context.Context, addr string, tc *tls.Config, qc *quic.Config) (*quic.Conn, error) {
 				conn, err := quic.DialAddrEarly(ctx, addr, tc, qc)
