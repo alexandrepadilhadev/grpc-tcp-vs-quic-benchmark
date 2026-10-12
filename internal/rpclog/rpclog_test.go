@@ -12,24 +12,42 @@ import (
 
 	"connectrpc.com/connect"
 
-	benchv1 "github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/bench/v1"
-	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/bench/v1/benchv1connect"
-	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/benchsvc"
+	paymentv1 "github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1"
+	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1/paymentv1connect"
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/rpclog"
 )
 
-// call serves BenchService with the interceptor at level and sends one RPC.
-func call(t *testing.T, level slog.Level, size uint32) ([]map[string]any, error) {
+// ledger answers SETTLED, or fails with code when it is set.
+type ledger struct{ code connect.Code }
+
+func (l ledger) Settle(context.Context, *connect.Request[paymentv1.SettleRequest]) (*connect.Response[paymentv1.SettleResponse], error) {
+	if l.code != 0 {
+		return nil, connect.NewError(l.code, nil)
+	}
+	return connect.NewResponse(&paymentv1.SettleResponse{Status: paymentv1.PaymentStatus_PAYMENT_STATUS_SETTLED}), nil
+}
+
+// call sends one Settle with the interceptor on both ends; it returns the
+// server and client log lines.
+func call(t *testing.T, level slog.Level, code connect.Code) (srvLines, cliLines []map[string]any, err error) {
 	t.Helper()
-	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level}))
+	var srvBuf, cliBuf bytes.Buffer
+	opts := &slog.HandlerOptions{Level: level}
 	mux := http.NewServeMux()
-	mux.Handle(benchv1connect.NewBenchServiceHandler(benchsvc.New(), connect.WithInterceptors(rpclog.Interceptor(log))))
+	mux.Handle(paymentv1connect.NewLedgerServiceHandler(ledger{code},
+		connect.WithInterceptors(rpclog.Interceptor(slog.New(slog.NewJSONHandler(&srvBuf, opts))))))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	cli := benchv1connect.NewBenchServiceClient(srv.Client(), srv.URL)
-	_, err := cli.Unary(context.Background(), connect.NewRequest(&benchv1.UnaryRequest{ResponseSize: size}))
+	cli := paymentv1connect.NewLedgerServiceClient(srv.Client(), srv.URL,
+		connect.WithInterceptors(rpclog.Interceptor(slog.New(slog.NewJSONHandler(&cliBuf, opts)))))
+	_, err = cli.Settle(context.Background(), connect.NewRequest(&paymentv1.SettleRequest{
+		PaymentId: "p1", AccountId: 1, AmountCents: 1000, AuthCode: "ABC123"}))
+	return parse(t, &srvBuf), parse(t, &cliBuf), err
+}
+
+func parse(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
 	var lines []map[string]any
 	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		if l == "" {
@@ -41,45 +59,48 @@ func call(t *testing.T, level slog.Level, size uint32) ([]map[string]any, error)
 		}
 		lines = append(lines, m)
 	}
-	return lines, err
+	return lines
 }
 
-func TestLogsOK(t *testing.T) {
-	lines, err := call(t, slog.LevelDebug, 16)
+func TestLogsServerAndClient(t *testing.T) {
+	srv, cli, err := call(t, slog.LevelDebug, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 1 {
-		t.Fatalf("lines = %v; want 1", lines)
+	if len(srv) != 1 || len(cli) != 1 {
+		t.Fatalf("server %v client %v; want 1 line each", srv, cli)
 	}
-	l := lines[0]
-	if l["msg"] != "rpc" || l["level"] != "DEBUG" || l["code"] != "ok" ||
-		l["procedure"] != benchv1connect.BenchServiceUnaryProcedure {
-		t.Fatalf("line = %v", l)
+	s := srv[0]
+	if s["msg"] != "rpc" || s["level"] != "DEBUG" || s["code"] != "ok" || s["side"] != "server" ||
+		s["payment_id"] != "p1" || s["procedure"] != paymentv1connect.LedgerServiceSettleProcedure {
+		t.Fatalf("server line = %v", s)
 	}
-	if d, ok := l["duration_us"].(float64); !ok || d < 0 {
-		t.Fatalf("duration_us = %v", l["duration_us"])
+	if d, ok := s["duration_us"].(float64); !ok || d < 0 {
+		t.Fatalf("duration_us = %v", s["duration_us"])
 	}
-	if l["peer"] == "" || l["protocol"] != connect.ProtocolConnect {
-		t.Fatalf("peer/protocol = %v %v", l["peer"], l["protocol"])
+	if s["peer"] == "" || s["protocol"] != connect.ProtocolConnect {
+		t.Fatalf("peer/protocol = %v %v", s["peer"], s["protocol"])
+	}
+	if c := cli[0]; c["side"] != "client" || c["payment_id"] != "p1" || c["code"] != "ok" {
+		t.Fatalf("client line = %v", c)
 	}
 }
 
 func TestLogsError(t *testing.T) {
-	lines, err := call(t, slog.LevelDebug, benchsvc.MaxResponseBytes+1)
-	if connect.CodeOf(err) != connect.CodeInvalidArgument {
-		t.Fatalf("client err = %v; want invalid_argument unchanged", err)
+	srv, cli, err := call(t, slog.LevelDebug, connect.CodeUnavailable)
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("client err = %v; want unavailable unchanged", err)
 	}
-	if len(lines) != 1 || lines[0]["code"] != "invalid_argument" || lines[0]["level"] != "DEBUG" {
-		t.Fatalf("lines = %v", lines)
+	if len(srv) != 1 || srv[0]["code"] != "unavailable" || len(cli) != 1 || cli[0]["code"] != "unavailable" {
+		t.Fatalf("server %v client %v", srv, cli)
 	}
 }
 
 func TestSilentAtInfo(t *testing.T) {
-	for _, size := range []uint32{16, benchsvc.MaxResponseBytes + 1} {
-		lines, _ := call(t, slog.LevelInfo, size)
-		if len(lines) != 0 {
-			t.Fatalf("size %d: lines = %v; want none at info", size, lines)
+	for _, code := range []connect.Code{0, connect.CodeUnavailable} {
+		srv, cli, _ := call(t, slog.LevelInfo, code)
+		if len(srv)+len(cli) != 0 {
+			t.Fatalf("code %v: server %v client %v; want none at info", code, srv, cli)
 		}
 	}
 }
