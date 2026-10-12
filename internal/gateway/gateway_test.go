@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -9,6 +10,8 @@ import (
 	"connectrpc.com/connect"
 
 	paymentv1 "github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1"
+	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1/paymentv1connect"
+	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/payment"
 )
 
 // core answers SETTLED/ABC123, or fails with code when set.
@@ -59,5 +62,34 @@ func TestCoreErrorPropagates(t *testing.T) {
 	_, err := create(New(&core{code: connect.CodeDeadlineExceeded}, slog.New(slog.DiscardHandler)), "p1")
 	if connect.CodeOf(err) != connect.CodeDeadlineExceeded {
 		t.Fatalf("err = %v; want deadline_exceeded", err)
+	}
+}
+
+var sink any
+
+// createNoLogs is CreatePayment's work without logs; noinline keeps the
+// core call behind the interface, as in the handler.
+//
+//go:noinline
+func createNoLogs(ctx context.Context, cc paymentv1connect.CoreServiceClient, req *connect.Request[paymentv1.CreatePaymentRequest]) any {
+	m := req.Msg
+	_ = payment.Validate(m.GetPaymentId(), m.GetAccountId(), m.GetAmountCents())
+	resp, _ := cc.ProcessPayment(ctx, connect.NewRequest(&paymentv1.ProcessPaymentRequest{
+		PaymentId: m.GetPaymentId(), AccountId: m.GetAccountId(), AmountCents: m.GetAmountCents()}))
+	return connect.NewResponse(&paymentv1.CreatePaymentResponse{
+		PaymentId: m.GetPaymentId(), Status: resp.Msg.GetStatus(), AuthCode: resp.Msg.GetAuthCode()})
+}
+
+// TestNoDebugCostAtInfo pins spec §11: with debug off, the handler's step logs
+// cost one level check, so it allocates no more than the same work without logs.
+func TestNoDebugCostAtInfo(t *testing.T) {
+	ctx := context.Background()
+	c := &core{}
+	h := New(c, slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	req := connect.NewRequest(&paymentv1.CreatePaymentRequest{PaymentId: "p1", AccountId: 4821, AmountCents: 1000})
+	got := testing.AllocsPerRun(200, func() { sink, _ = h.CreatePayment(ctx, req) })
+	want := testing.AllocsPerRun(200, func() { sink = createNoLogs(ctx, c, req) })
+	if got > want {
+		t.Fatalf("allocs at info = %v; want <= %v (debug args must not be built)", got, want)
 	}
 }

@@ -20,6 +20,12 @@ func WriteReport(dir string, r Report) error {
 	if dir == "" {
 		return nil
 	}
+	if r.Dials == nil { // same shape in every file: {} rather than null
+		r.Dials = map[string]int64{}
+	}
+	if r.Counters == nil {
+		r.Counters = map[string]int64{}
+	}
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err

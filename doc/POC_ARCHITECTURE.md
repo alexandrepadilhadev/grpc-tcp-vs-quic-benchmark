@@ -142,24 +142,24 @@ The payment gateway described in the project is built **inside this repository**
 
 ```mermaid
 flowchart TB
-  lg["Load generator<br/>(reused from the POC)"]
-  gw["API Gateway · orders service<br/>single entry point<br/>transaction orchestration"]
-  core["Core · processing service<br/>financial business rules"]
+  lg["Load generator<br/>(reused)"]
+  gw["API Gateway<br/>orders"]
+  core["Core<br/>processing"]
   acq["External acquirers<br/>(simulated)"]
-  ledger["Ledger · accounts service<br/>concurrency control<br/>balance updates"]
-  db[("Database<br/>transactional SQL")]
-  mq[["Message broker<br/>pub/sub queue (AMQP)"]]
-  risk["Risk · anti-fraud service<br/>risk scoring"]
+  ledger["Ledger<br/>accounts"]
+  db[("Database<br/>SQL")]
+  mq[["Message broker<br/>AMQP"]]
+  risk["Risk<br/>anti-fraud"]
 
-  lg <-- "gRPC h2|h3<br/>authorization request ⇄ payment response" --> gw
-  gw <-- "gRPC h2|h3<br/>authorization request ⇄ processing result" --> core
-  core <-- "authorization request ⇄<br/>approved / declined" --> acq
-  core <-- "gRPC h2|h3<br/>settlement request ⇄ final payment state" --> ledger
-  ledger <-- "SQL transaction (ACID)<br/>statements ⇄ rows / commit" --> db
-  core -. "publish payment event" .-> mq
+  lg <-- "gRPC h2|h3" --> gw
+  gw <-- "gRPC h2|h3" --> core
+  core <-- "authorization" --> acq
+  core <-- "gRPC h2|h3<br/>settlement" --> ledger
+  ledger <-- "SQL (ACID)" --> db
+  core -. "payment event" .-> mq
   mq -. "risk result" .-> core
-  mq -. "consume event" .-> risk
-  risk -. "publish risk result" .-> mq
+  mq -. "event" .-> risk
+  risk -. "risk result" .-> mq
 
   classDef reuse fill:#dbe9fb,stroke:#2a78d6,color:#1a1a19
   classDef new fill:#fde3d7,stroke:#eb6834,color:#1a1a19

@@ -43,7 +43,10 @@ func (h *Handler) ProcessPayment(ctx context.Context, req *connect.Request[payme
 	if err := payment.Validate(id, m.GetAccountId(), m.GetAmountCents()); err != nil {
 		return nil, err
 	}
-	h.log.DebugContext(ctx, "payment received", "payment_id", id, "account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	debug := h.log.Enabled(ctx, slog.LevelDebug) // args are built only when debug is on
+	if debug {
+		h.log.DebugContext(ctx, "payment received", "payment_id", id, "account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	}
 
 	if h.acquirerDelay > 0 {
 		t := time.NewTimer(h.acquirerDelay)
@@ -58,13 +61,18 @@ func (h *Handler) ProcessPayment(ctx context.Context, req *connect.Request[payme
 		}
 	}
 	code := AuthCode(id)
-	h.log.DebugContext(ctx, "acquirer approved", "payment_id", id, "auth_code", code)
+	if debug {
+		h.log.DebugContext(ctx, "acquirer approved", "payment_id", id, "auth_code", code)
+	}
 
-	if h.events.Offer(&paymentv1.PaymentEvent{PaymentId: id, AccountId: m.GetAccountId(),
-		AmountCents: m.GetAmountCents(), CreatedNs: time.Now().UnixNano()}) {
-		h.log.DebugContext(ctx, "event queued", "payment_id", id)
-	} else {
-		h.log.DebugContext(ctx, "event dropped", "payment_id", id)
+	queued := h.events.Offer(&paymentv1.PaymentEvent{PaymentId: id, AccountId: m.GetAccountId(),
+		AmountCents: m.GetAmountCents(), CreatedNs: time.Now().UnixNano()})
+	if debug {
+		msg := "event queued"
+		if !queued {
+			msg = "event dropped"
+		}
+		h.log.DebugContext(ctx, msg, "payment_id", id)
 	}
 
 	resp, err := h.ledger.Settle(ctx, connect.NewRequest(&paymentv1.SettleRequest{

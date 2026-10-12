@@ -206,3 +206,25 @@ func TestWriteReport(t *testing.T) {
 		t.Fatalf(`WriteReport("") = %v; want no-op`, err)
 	}
 }
+
+// TestWriteReportEmptyMaps: every svc-*.json has the same shape, so the
+// analysis can read dials/counters without special cases.
+func TestWriteReportEmptyMaps(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteReport(dir, Report{Service: "risk"}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "svc-risk.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"dials", "counters"} {
+		if _, ok := m[k].(map[string]any); !ok {
+			t.Fatalf("%s = %v; want an object, not null: %s", k, m[k], b)
+		}
+	}
+}

@@ -24,7 +24,7 @@ subjectKeyIdentifier = hash
 EOF
 
 cat > server.ext <<'EOF'
-subjectAltName = DNS:server,DNS:localhost,IP:127.0.0.1
+subjectAltName = DNS:gateway,DNS:core,DNS:ledger,DNS:localhost,IP:127.0.0.1
 extendedKeyUsage = serverAuth
 keyUsage = critical,digitalSignature
 authorityKeyIdentifier = keyid
@@ -33,7 +33,7 @@ EOF
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key
 openssl req -x509 -new -key ca.key -config ca.cnf -days 3650 -out ca.crt
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key
-openssl req -new -key server.key -subj /CN=server -out server.csr
+openssl req -new -key server.key -subj /CN=gateway -out server.csr
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -days 825 -extfile server.ext -out server.crt
 rm -f ca.cnf server.ext server.csr ca.srl

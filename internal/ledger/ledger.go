@@ -42,8 +42,11 @@ func (h *Handler) Settle(ctx context.Context, req *connect.Request[paymentv1.Set
 	if m.GetAuthCode() == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("auth_code is required"))
 	}
-	h.log.DebugContext(ctx, "settle received", "payment_id", m.GetPaymentId(),
-		"account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	debug := h.log.Enabled(ctx, slog.LevelDebug) // args are built only when debug is on
+	if debug {
+		h.log.DebugContext(ctx, "settle received", "payment_id", m.GetPaymentId(),
+			"account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	}
 	st, err := h.store.Settle(ctx, Entry{m.GetPaymentId(), m.GetAccountId(), m.GetAmountCents(), m.GetAuthCode()})
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -54,10 +57,12 @@ func (h *Handler) Settle(ctx context.Context, req *connect.Request[paymentv1.Set
 		}
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	if st == paymentv1.PaymentStatus_PAYMENT_STATUS_SETTLED {
-		h.log.DebugContext(ctx, "debit applied", "payment_id", m.GetPaymentId())
-	} else {
-		h.log.DebugContext(ctx, "declined", "payment_id", m.GetPaymentId())
+	if debug {
+		msg := "debit applied"
+		if st != paymentv1.PaymentStatus_PAYMENT_STATUS_SETTLED {
+			msg = "declined"
+		}
+		h.log.DebugContext(ctx, msg, "payment_id", m.GetPaymentId())
 	}
 	return connect.NewResponse(&paymentv1.SettleResponse{Status: st}), nil
 }

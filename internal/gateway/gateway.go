@@ -28,8 +28,10 @@ func (h *Handler) CreatePayment(ctx context.Context, req *connect.Request[paymen
 	if err := payment.Validate(m.GetPaymentId(), m.GetAccountId(), m.GetAmountCents()); err != nil {
 		return nil, err
 	}
-	h.log.DebugContext(ctx, "payment received", "payment_id", m.GetPaymentId(),
-		"account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	if h.log.Enabled(ctx, slog.LevelDebug) { // args are built only when debug is on
+		h.log.DebugContext(ctx, "payment received", "payment_id", m.GetPaymentId(),
+			"account_id", m.GetAccountId(), "amount_cents", m.GetAmountCents())
+	}
 	resp, err := h.core.ProcessPayment(ctx, connect.NewRequest(&paymentv1.ProcessPaymentRequest{
 		PaymentId: m.GetPaymentId(), AccountId: m.GetAccountId(), AmountCents: m.GetAmountCents()}))
 	if err != nil {
