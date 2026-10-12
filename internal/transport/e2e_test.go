@@ -1,6 +1,7 @@
 package transport_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -303,5 +306,33 @@ func TestBurstSingleDial(t *testing.T) {
 				t.Fatalf("failed=%d dials=%d; want 0 and 1", failed.Load(), cli.Dials())
 			}
 		})
+	}
+}
+
+// With QLOGDIR set, both QUIC endpoints write a qlog trace there.
+func TestQlogDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("QLOGDIR", dir)
+	url, cfg, stop := startServer(t, transport.H3, http.HandlerFunc(okHandler), nil)
+	cli := newClient(t, cfg)
+	if _, err := get(context.Background(), cli, url); err != nil {
+		t.Fatal(err)
+	}
+	_ = cli.Close()
+	_ = stop()
+	for _, side := range []string{"client", "server"} {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			files, _ := filepath.Glob(filepath.Join(dir, "*_"+side+".sqlog"))
+			if len(files) == 1 {
+				if b, _ := os.ReadFile(files[0]); bytes.Contains(b, []byte(`"transport:packet_sent"`)) {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no %s qlog with packet events in %s (found %v)", side, dir, files)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 }

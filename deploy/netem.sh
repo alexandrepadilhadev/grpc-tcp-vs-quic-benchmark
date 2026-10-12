@@ -11,12 +11,15 @@ clear_qdisc() {
 
 # apply sets NETEM_DELAY (ms), NETEM_JITTER (ms), NETEM_DIST and NETEM_LOSS (%);
 # zero values are omitted and all zeros remove the qdisc.
+# With jitter, "rate" makes netem schedule each packet no earlier than the previous
+# one (FIFO, no reordering); 10gbit adds ~1 us per packet. A pfifo child does not
+# help: netem hands packets to it only after their per-packet delay.
 apply() {
 	set --
 	if [ "${NETEM_DELAY:-0}" != 0 ] || [ "${NETEM_JITTER:-0}" != 0 ]; then
 		set -- delay "${NETEM_DELAY:-0}ms"
 		if [ "${NETEM_JITTER:-0}" != 0 ]; then
-			set -- "$@" "${NETEM_JITTER}ms" distribution "${NETEM_DIST:-normal}"
+			set -- "$@" "${NETEM_JITTER}ms" distribution "${NETEM_DIST:-normal}" rate 10gbit
 		fi
 	fi
 	if [ "${NETEM_LOSS:-0}" != 0 ]; then

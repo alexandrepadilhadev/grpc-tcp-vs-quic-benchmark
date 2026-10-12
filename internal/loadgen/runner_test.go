@@ -141,6 +141,38 @@ func TestCOCorrection(t *testing.T) {
 	}
 }
 
+func TestUnsentCountsMeasureSlotsOnly(t *testing.T) {
+	cfg := base()
+	cfg.RPS, cfg.Concurrency = 100, 1
+	cfg.Warmup, cfg.Duration = 100*time.Millisecond, 100*time.Millisecond
+	// The only worker is stuck past the window, so the pacer never leaves the warm-up.
+	_, res := runRows(t, context.Background(), cfg, func(context.Context) (int, error) {
+		time.Sleep(300 * time.Millisecond)
+		return 10, nil
+	})
+	if res.Total != 0 || res.Unsent != 10 {
+		t.Fatalf("total=%d unsent=%d; want 0 and the 10 measure slots", res.Total, res.Unsent)
+	}
+}
+
+func TestLateStartsCountMeasureSlotsOnly(t *testing.T) {
+	cfg := base()
+	cfg.RPS, cfg.Concurrency = 100, 1
+	cfg.Warmup, cfg.Duration = 300*time.Millisecond, 50*time.Millisecond
+	var n atomic.Int64
+	// The first call makes ~20 warm-up slots late. Only measure slots may count, and every
+	// measure slot sent is recorded, so LateStarts <= Total holds regardless of scheduler jitter.
+	_, res := runRows(t, context.Background(), cfg, func(context.Context) (int, error) {
+		if n.Add(1) == 1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		return 10, nil
+	})
+	if res.Total == 0 || res.LateStarts > res.Total {
+		t.Fatalf("late=%d total=%d; want late <= total (measure slots only)", res.LateStarts, res.Total)
+	}
+}
+
 func TestCancel(t *testing.T) {
 	cfg := base()
 	cfg.Duration = 10 * time.Second

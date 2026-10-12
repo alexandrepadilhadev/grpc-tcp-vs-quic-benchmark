@@ -11,6 +11,7 @@ x-netem: &netem
   NETEM_JITTER: ${NETEM_JITTER:-0}
   NETEM_DIST: ${NETEM_DIST:-normal}
   NETEM_LOSS: ${NETEM_LOSS:-0}
+  QLOGDIR: ${QLOGDIR:-} # set by run.sh with QLOG=1; empty = no QUIC tracing
 
 services:
   server:
@@ -29,7 +30,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     cap_add: [NET_ADMIN]
     cpuset: "${SERVER_CPUS:-2-3}"
-    volumes: ["../certs:/certs:ro"]
+    volumes: ["../certs:/certs:ro", "../results:/results"]
     networks: [benchnet]
     healthcheck:
       test: ["CMD", "/usr/local/bin/server", "healthcheck"]

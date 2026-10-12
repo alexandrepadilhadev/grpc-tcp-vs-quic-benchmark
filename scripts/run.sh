@@ -2,7 +2,9 @@
 # Experiment runner (spec §6.4).
 #   bash scripts/run.sh                              every scenario x {h2,h3} x REPS
 #   bash scripts/run.sh rep <env> <transport> <dir>  one repetition (own process)
-# Env: SCENARIOS (glob over experiments/scenarios, default *), REPS (default 5).
+# Env: SCENARIOS (glob over experiments/scenarios, default *), REPS (default 5),
+# QLOG=1 (diagnostics only: qlog of both QUIC endpoints in <rep>/qlog/ and the
+# server's TCP counters in <rep>/nstat.txt; tracing costs CPU, do not use for measurements).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,6 +42,7 @@ rep() {
 	set +a
 	mkdir -p "$dir"
 	trap cleanup EXIT
+	[[ -z ${QLOG:-} ]] || export QLOGDIR=/results/${dir#results/}/qlog # path inside the containers
 
 	"${COMPOSE[@]}" up -d --wait server
 	sample_stats >"$dir/stats.csv" &
@@ -55,6 +58,21 @@ rep() {
 		wait "$outage"
 		outage=
 	fi
+	if [[ -n ${QLOG:-} ]]; then
+		"${COMPOSE[@]}" exec -T server nstat -az >"$dir/nstat.txt" 2>&1 || true
+	fi
+}
+
+# run_rep runs repetition r into <base>/rep-<r> in its own process. Handshake packets
+# lost under netem can outlast the probe deadline, so a probe failure is retried once;
+# the failed attempt is kept as <base>/probe-failed-rep-<r> (ignored by the analysis).
+run_rep() {
+	local env=$1 t=$2 base=$3 r=$4
+	bash scripts/run.sh rep "$env" "$t" "$base/rep-$r" && return 0
+	grep -q '"loadgen failed","error":"probe:' "$base/rep-$r/loadgen.log" 2>/dev/null || return 1
+	echo "!! rep-$r probe failed, retrying once" >&2
+	mv "$base/rep-$r" "$base/probe-failed-rep-$r"
+	bash scripts/run.sh rep "$env" "$t" "$base/rep-$r"
 }
 
 matrix() {
@@ -81,7 +99,7 @@ matrix() {
 			((r % 2)) || order=(h3 h2)
 			for t in "${order[@]}"; do
 				echo "== $scenario $t rep-$r"
-				if ! bash scripts/run.sh rep "$env" "$t" "$root/$scenario/$t/rep-$r"; then
+				if ! run_rep "$env" "$t" "$root/$scenario/$t" "$r"; then
 					echo "$scenario,$t,$r" >>"$root/failures.log"
 					echo "!! $scenario $t rep-$r failed (see failures.log)" >&2
 				fi
