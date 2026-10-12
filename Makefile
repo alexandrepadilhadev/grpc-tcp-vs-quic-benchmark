@@ -26,7 +26,7 @@ test-db:
 smoke:
 	mkdir -p results/smoke/$(TRANSPORT)
 	REP_DIR=/results/smoke/$(TRANSPORT) $(COMPOSE) up -d --wait gateway risk
-	$(COMPOSE) run --rm loadgen --target=gateway:8443 --requests=1000 --warmup=0 --strict \
+	$(COMPOSE) run --rm --no-deps loadgen --target=gateway:8443 --requests=1000 --warmup=0 --strict \
 		--out=/results/smoke/$(TRANSPORT)/requests.csv; rc=$$?; sleep 2; \
 	$(COMPOSE) exec -T postgres psql -U postgres -tAc 'select count(*) from entries'; \
 	$(COMPOSE) --profile load down -v; exit $$rc
