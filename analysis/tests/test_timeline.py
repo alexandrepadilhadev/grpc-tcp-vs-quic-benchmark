@@ -16,8 +16,8 @@ def write_logs(d):
     log(d / "gateway.log",
         {"time": "2026-10-12T09:59:59.000000000-03:00", "level": "INFO", "msg": "gateway started", "version": "v1"},
         {"time": "2026-10-12T10:00:00.000500000-03:00", "level": "DEBUG", "msg": "payment received", "payment_id": "p1"},
-        {"time": "2026-10-12T10:00:00.001000000-03:00", "level": "DEBUG", "msg": "rpc", "side": "server",
-         "code": "ok", "protocol": "HTTP/3.0", "payment_id": "p1"})
+        {"time": "2026-10-12T10:00:00.001000000-03:00", "level": "DEBUG", "msg": "rpc", "side": "client",
+         "code": "ok", "protocol": "grpc", "payment_id": "p1", "http": "HTTP/3.0"})
     log(d / "loadgen.log",
         {"time": "2026-10-12T10:00:00.000000000-03:00", "level": "DEBUG", "msg": "payment request", "payment_id": "p1", "account_id": 4821},
         {"time": "2026-10-12T10:00:00.003000000-03:00", "level": "DEBUG", "msg": "payment response", "payment_id": "p1", "code": "ok"},

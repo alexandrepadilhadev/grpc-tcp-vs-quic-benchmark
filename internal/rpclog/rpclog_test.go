@@ -15,6 +15,7 @@ import (
 	paymentv1 "github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1"
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/gen/payment/v1/paymentv1connect"
 	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/rpclog"
+	"github.com/alexandrepadilhadev/grpc-tcp-vs-quic-benchmark/internal/transport"
 )
 
 // ledger answers SETTLED, or fails with code when it is set.
@@ -36,7 +37,11 @@ func call(t *testing.T, level slog.Level, code connect.Code) (srvLines, cliLines
 	mux := http.NewServeMux()
 	mux.Handle(paymentv1connect.NewLedgerServiceHandler(ledger{code},
 		connect.WithInterceptors(rpclog.Interceptor(slog.New(slog.NewJSONHandler(&srvBuf, opts))))))
-	srv := httptest.NewServer(mux)
+	// as transport.Server does: every response names the HTTP version served
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(transport.HeaderServedProto, r.Proto)
+		mux.ServeHTTP(w, r)
+	}))
 	defer srv.Close()
 
 	cli := paymentv1connect.NewLedgerServiceClient(srv.Client(), srv.URL,
@@ -81,8 +86,11 @@ func TestLogsServerAndClient(t *testing.T) {
 	if s["peer"] == "" || s["protocol"] != connect.ProtocolConnect {
 		t.Fatalf("peer/protocol = %v %v", s["peer"], s["protocol"])
 	}
-	if c := cli[0]; c["side"] != "client" || c["payment_id"] != "p1" || c["code"] != "ok" {
-		t.Fatalf("client line = %v", c)
+	if c := cli[0]; c["side"] != "client" || c["payment_id"] != "p1" || c["code"] != "ok" || c["http"] != "HTTP/1.1" {
+		t.Fatalf("client line = %v; want http = the served HTTP version", c)
+	}
+	if _, ok := s["http"]; ok {
+		t.Fatalf("server line = %v; the server side cannot see the HTTP version", s)
 	}
 }
 

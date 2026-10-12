@@ -36,7 +36,7 @@ def render(entries: list[tuple[str, dict]]) -> str:
         by_id.setdefault(rec["payment_id"], []).append((t, svc, rec))
     blocks = []
     for pid, rows in sorted(by_id.items(), key=lambda kv: kv[1][0][0]):
-        proto = next((r["protocol"] for _, _, r in rows if r.get("msg") == "rpc" and "protocol" in r), "?")
+        proto = next((r["http"] for _, _, r in rows if "http" in r), "?")  # client rpc lines carry it
         lines = [f"payment {pid} ({proto})"]
         t0 = rows[0][0]
         for t, svc, rec in rows:
