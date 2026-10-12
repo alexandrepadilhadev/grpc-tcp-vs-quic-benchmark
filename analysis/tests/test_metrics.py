@@ -1,3 +1,4 @@
+import json
 import math
 
 import numpy as np
@@ -272,8 +273,9 @@ def test_comparison_ratio_only_for_throughput():
     assert math.isnan(analyze.comparison(reps).iloc[0].ratio)
 
 
-def write_rep(d, transport, outage=None, n=500, dials=1, rps=100):
-    """100 rps for n/100 s; requests started inside outage=(start_s, end_s) fail."""
+def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, names=("server",)):
+    """100 rps for n/100 s; requests started inside outage=(start_s, end_s) fail.
+    hops: {"svc-<name>.json": {peer: dials}}; names: service containers in stats.csv, each at 10%."""
     d.mkdir(parents=True)
     t0 = 1_700_000_000 * S
     lines = [HEADER]
@@ -288,11 +290,13 @@ def write_rep(d, transport, outage=None, n=500, dials=1, rps=100):
         f' "handshake_us": 4000, "ok": {n // 2}, "unsent": 0,'
         f' "load": {{"rps": {rps}, "duration_ns": {n // 100 * S}, "deadline_ns": {2 * S}}}}}'
     )
-    (d / "stats.csv").write_text(  # the idle sample before the measured window is ignored
-        "ts_ns,name,cpu_perc,mem_usage\n"
-        f"{t0 - S},bench-server-1,0%,0MiB / 1GiB\n{t0 - S},bench-loadgen,0%,0MiB / 1GiB\n"
-        f"{t0 + S},bench-server-1,10%,10MiB / 1GiB\n{t0 + S},bench-loadgen,30%,20MiB / 1GiB\n"
-    )
+    stats = ["ts_ns,name,cpu_perc,mem_usage\n"]  # the idle sample before the measured window is ignored
+    for ts, cpu, mem in [(t0 - S, 0, 0), (t0 + S, 10, 10)]:
+        stats += [f"{ts},bench-{c}-1,{cpu}%,{mem}MiB / 1GiB\n" for c in names]
+        stats.append(f"{ts},bench-loadgen,{3 * cpu}%,{2 * mem}MiB / 1GiB\n")
+    (d / "stats.csv").write_text("".join(stats))
+    for name, dials_by_peer in (hops or {}).items():
+        (d / name).write_text(json.dumps({"service": name, "dials": dials_by_peer, "counters": {}}))
     if outage:
         a, b = (int(t0 + x * S) for x in outage)
         (d / "events.csv").write_text(f"event,ts_ns\noutage_start,{a}\noutage_end,{b}\n")
@@ -420,3 +424,60 @@ def test_main_recovery_with_outage_off_bin_edge(tmp_path):
 
 def test_main_empty_run(tmp_path):
     assert analyze.main([str(tmp_path)]) == 1
+
+
+HOPS = {  # a clean payment repetition: every service wrote its report
+    "svc-gateway.json": {"core:8443": 1},
+    "svc-core.json": {"ledger-rpc:8443": 1},
+    "svc-ledger.json": {},
+    "svc-risk.json": {},
+}
+
+
+def hop_run(tmp_path):
+    """s1-baseline, 2 payment reps per transport; returns h3 rep-2 to spoil."""
+    for t in ["h2", "h3"]:
+        for r in [1, 2]:
+            write_rep(tmp_path / "s1-baseline" / t / f"rep-{r}", t, hops=HOPS)
+    return tmp_path / "s1-baseline" / "h3" / "rep-2"
+
+
+def assert_h3_rep_skipped(tmp_path, capsys, reason):
+    assert analyze.main([str(tmp_path)]) == 0
+    s = pd.read_csv(tmp_path / "analysis" / "summary.csv").set_index(["scenario", "transport"])
+    assert s.loc[("s1-baseline", "h3"), "n"] == 1 and s.loc[("s1-baseline", "h2"), "n"] == 2
+    assert f"{reason}, skipped" in capsys.readouterr().err
+
+
+def test_main_skips_bad_hop_dials(tmp_path, capsys):
+    (hop_run(tmp_path) / "svc-gateway.json").write_text('{"service": "gateway", "dials": {"core:8443": 2}, "counters": {}}')
+    assert_h3_rep_skipped(tmp_path, capsys, "svc-gateway.json core:8443 dials=2")
+
+
+def test_main_skips_missing_hop_file(tmp_path, capsys):
+    # core killed before its report: the core->ledger hop cannot be checked
+    (hop_run(tmp_path) / "svc-core.json").unlink()
+    assert_h3_rep_skipped(tmp_path, capsys, "svc-core.json missing")
+
+
+def test_main_skips_unreadable_hop_file(tmp_path, capsys):
+    (hop_run(tmp_path) / "svc-ledger.json").write_text('{"service": "led')  # write cut by SIGKILL
+    assert_h3_rep_skipped(tmp_path, capsys, "svc-ledger.json unreadable")
+
+
+def test_main_without_hop_files_uses_meta_only(tmp_path):
+    for t in ["h2", "h3"]:
+        write_rep(tmp_path / "s1-baseline" / t / "rep-1", t)
+    assert analyze.main([str(tmp_path)]) == 0
+    s = pd.read_csv(tmp_path / "analysis" / "summary.csv").set_index(["scenario", "transport"])
+    assert s.loc[("s1-baseline", "h2"), "n"] == 1 and s.loc[("s1-baseline", "h3"), "n"] == 1
+
+
+def test_rpc_cpu(tmp_path):
+    for t in ["h2", "h3"]:
+        write_rep(tmp_path / "s1-baseline" / t / "rep-1", t, names=("gateway", "core", "ledger", "postgres"))
+    assert analyze.main([str(tmp_path)]) == 0
+    s = pd.read_csv(tmp_path / "analysis" / "summary.csv").set_index(["scenario", "transport"])
+    row = s.loc[("s1-baseline", "h3")]
+    assert row["rpc_cpu_mean"] == pytest.approx(30.0)  # gateway + core + ledger, not postgres
+    assert row["cpu_per_krps_mean"] == pytest.approx(30.0 / (row["ok_rps_mean"] / 1000))

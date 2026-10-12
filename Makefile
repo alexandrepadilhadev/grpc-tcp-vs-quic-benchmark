@@ -4,7 +4,7 @@ TRANSPORT ?= h2
 REPS      ?= 5
 export VERSION TRANSPORT
 
-.PHONY: certs build test test-db test-py smoke run-all analyze down
+.PHONY: certs build test test-db test-py smoke trace run-all analyze down
 
 certs:
 	bash scripts/gen-certs.sh
@@ -30,6 +30,12 @@ smoke:
 		--out=/results/smoke/$(TRANSPORT)/requests.csv; rc=$$?; sleep 2; \
 	$(COMPOSE) exec -T postgres psql -U postgres -tAc 'select count(*) from entries'; \
 	$(COMPOSE) --profile load down -v; exit $$rc
+
+# every service at debug level, 20 payments; timeline.txt in results/trace-<time>/<transport>/
+SCENARIO ?= s1-baseline
+trace: build
+	mkdir -p results
+	bash scripts/run.sh trace $(TRANSPORT) $(SCENARIO)
 
 run-all: build
 	mkdir -p results

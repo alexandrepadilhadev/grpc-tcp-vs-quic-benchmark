@@ -25,6 +25,8 @@ COMPARE = [
     "p50", "p99", "p999", "p50_all", "p99_all", "p999_all", "error_rate", "ok_rps", "served_frac", "recovery_s", "cpu_per_krps", "handshake_ms",
 ]
 RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
+RPC_SERVICES = ["gateway", "core", "ledger"]  # the gRPC services whose CPU makes rpc_cpu
+SVC_REPORTS = ["gateway", "core", "ledger", "risk"]  # svc-<name>.json each payment repetition must have
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -378,6 +380,27 @@ def plot_outage(series, path):
     _save(fig, path)
 
 
+def hop_problems(d) -> list[str]:
+    """Why the per-hop reports of a payment repetition invalidate it: a missing or
+    unreadable svc-<name>.json, or a hop that did not use exactly one connection.
+    POC repetitions (no svc-*.json at all) have none."""
+    if not any(d.glob("svc-*.json")):
+        return []
+    bad = []
+    for svc in SVC_REPORTS:
+        f = d / f"svc-{svc}.json"
+        if not f.exists():
+            bad.append(f"{f.name} missing")
+            continue
+        try:
+            dials = json.loads(f.read_text())["dials"].items()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            bad.append(f"{f.name} unreadable")
+            continue
+        bad += [f"{f.name} {peer} dials={n}" for peer, n in dials if n != 1]
+    return bad
+
+
 def _rep_row(d, name):
     """Metrics of one repetition dir, or None when it is not valid."""
     meta_path = d / "meta.json"
@@ -390,6 +413,9 @@ def _rep_row(d, name):
         return None
     if meta.get("dials") != 1:  # spec §9: more than one connection invalidates the rep
         _warn(f"{name}: dials={meta.get('dials')}, skipped")
+        return None
+    for problem in hop_problems(d):  # the same rule on every internal hop (payment spec §10)
+        _warn(f"{name}: {problem}, skipped")
         return None
     df = load_requests(d / "requests.csv")
     if not (df.status == "ok").any():
@@ -407,8 +433,11 @@ def _rep_row(d, name):
     if (d / "stats.csv").exists():
         end = df.start_ns + df.latency_us * 1000
         row.update(_container_stats(d / "stats.csv", df.start_ns.min(), end.max()))
-        if "server_cpu" in row:
-            row["cpu_per_krps"] = row["server_cpu"] / (row["ok_rps"] / 1000)
+        if all(f"{c}_cpu" in row for c in RPC_SERVICES):
+            row["rpc_cpu"] = sum(row[f"{c}_cpu"] for c in RPC_SERVICES)
+        cpu = row.get("rpc_cpu", row.get("server_cpu"))  # payment system, else the POC server
+        if cpu is not None:
+            row["cpu_per_krps"] = cpu / (row["ok_rps"] / 1000)
     else:
         _warn(f"{name}: no stats.csv")
     return row, df, meta
