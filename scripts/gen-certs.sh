@@ -24,7 +24,7 @@ subjectKeyIdentifier = hash
 EOF
 
 cat > server.ext <<'EOF'
-subjectAltName = DNS:gateway,DNS:core,DNS:ledger,DNS:localhost,IP:127.0.0.1
+subjectAltName = DNS:gateway,DNS:core,DNS:ledger,DNS:ledger-rpc,DNS:localhost,IP:127.0.0.1
 extendedKeyUsage = serverAuth
 keyUsage = critical,digitalSignature
 authorityKeyIdentifier = keyid

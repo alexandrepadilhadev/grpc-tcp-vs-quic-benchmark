@@ -63,7 +63,8 @@ services:
     command: ["/usr/local/bin/core"]
     environment:
       <<: *grpc-env
-      LEDGER_ADDR: ledger:8443
+      # ledger-rpc exists only on rpcnet: "ledger" may resolve to datanet and skip netem
+      LEDGER_ADDR: ledger-rpc:8443
       AMQP_URL: amqp://bench:bench@rabbitmq:5672/
       ACQUIRER_DELAY: ${ACQUIRER_DELAY:-0s}
     cpuset: "${CORE_CPUS:-3}"
@@ -85,7 +86,10 @@ services:
       DATABASE_URL: postgres://postgres:bench@postgres:5432/postgres
       DB_MAX_CONNS: ${DB_MAX_CONNS:-8}
     cpuset: "${LEDGER_CPUS:-4}"
-    networks: [rpcnet, datanet]
+    networks:
+      rpcnet:
+        aliases: [ledger-rpc]
+      datanet: {}
     healthcheck:
       <<: *health
       test: ["CMD", "/usr/local/bin/ledger", "healthcheck"]
