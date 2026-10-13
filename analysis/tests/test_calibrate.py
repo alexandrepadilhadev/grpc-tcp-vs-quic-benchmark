@@ -55,7 +55,6 @@ def test_capacity_is_the_highest_passing_h3_rate(tmp_path):
 
 @pytest.mark.parametrize("over", [
     {"served_frac": 0.989},
-    {"late_starts": 1},
     {"p50": 1.51},  # > 1.5x the p50 of the lowest rate
     {"postgres_cpu": 30, "rabbitmq_cpu": 30, "risk_cpu": 11},  # CPU 5 summed: 71%
 ])
@@ -80,3 +79,16 @@ def test_main_prints_table_and_rates(tmp_path, capsys):
     assert calibrate.main([str(r) for r in runs]) == 0
     out = capsys.readouterr().out
     assert "| rate | transport |" in out and "C = 500" in out and "high rate = 200" in out
+
+
+def test_late_starts_are_reported_not_judged(tmp_path):
+    # at low rates the VM's timer wake-ups delay starts without any saturation (spec §9)
+    runs = [calib_run(tmp_path, 250, [("h3", {})]), calib_run(tmp_path, 500, [("h3", {"late_starts": 900})])]
+    t = calibrate.table(runs)
+    assert calibrate.capacity(t) == 500
+    assert t.set_index(["rate", "transport"]).loc[(500, "h3"), "late_starts_max"] == 900
+
+
+def test_table_counts_cpu_outliers(tmp_path):
+    run = calib_run(tmp_path, 250, [("h3", {"cpu_outlier": True}), ("h3", {"cpu_outlier": False})])
+    assert calibrate.table([run]).set_index(["rate", "transport"]).loc[(250, "h3"), "cpu_outliers"] == 1

@@ -36,17 +36,20 @@ def table(runs: list[Path]) -> pd.DataFrame:
     reps = pd.concat([load(r) for r in runs], ignore_index=True)
     cpu = [f"{c}_cpu" for c in OWN_CPU if f"{c}_cpu" in reps] + ["data_cpu"]
     g = reps.groupby(["rate", "transport"])
+    # late_starts is reported, not judged: in the VM, timer wake-ups at low rates
+    # delay starts without saturation, which the CPU and p50 rules catch (spec §9)
     t = pd.DataFrame({
         "n": g.size(),
         "served_frac_min": g.served_frac.min(),
         "late_starts_max": g.late_starts.max(),
         "p50_median": g.p50.median(),
+        # host noise in the sweep itself: rerun the rate rather than trust its CPU
+        "cpu_outliers": g.cpu_outlier.sum() if "cpu_outlier" in reps else 0,
         **{f"{c}_max": g[c].max() for c in cpu},
     }).reset_index()
     base = t.sort_values("rate").groupby("transport").p50_median.transform("first")
     t["pass"] = (
         (t.served_frac_min >= SERVED_MIN)
-        & (t.late_starts_max == 0)
         & (t.p50_median <= P50_MAX * base)
         & (t[[f"{c}_max" for c in cpu]].max(axis=1) <= CPU_MAX)
     )

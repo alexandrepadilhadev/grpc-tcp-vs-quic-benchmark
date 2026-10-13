@@ -18,7 +18,7 @@ from scipy import stats  # noqa: E402
 
 NS = 1_000_000_000
 KEYS = ["scenario", "transport"]
-ID = ["run", "rep", "excluded"]  # reps.csv columns that are not metrics
+ID = ["run", "rep", "excluded", "cpu_outlier"]  # reps.csv columns that are not metrics
 QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
 COMPARE = [
@@ -401,6 +401,20 @@ def hop_problems(d) -> list[str]:
     return bad
 
 
+def cpu_outlier(reps: pd.DataFrame) -> pd.Series:
+    """True for reps whose cpu_per_krps is above the median + 3 MAD of their run x scenario x
+    transport: host noise makes the same load cost more CPU without lowering the throughput,
+    which degraded_s cannot see. MAD 0 (or no CPU data) flags nothing."""
+    if "cpu_per_krps" not in reps:
+        return pd.Series(False, index=reps.index)
+
+    def flag(x):
+        mad = (x - x.median()).abs().median()
+        return x > x.median() + 3 * mad if mad > 0 else pd.Series(False, index=x.index)
+
+    return reps.groupby(["run"] + KEYS, group_keys=False).cpu_per_krps.apply(flag).reindex(reps.index).astype(bool)
+
+
 def _rep_row(d, name):
     """Metrics of one repetition dir, or None when it is not valid."""
     meta_path = d / "meta.json"
@@ -485,7 +499,7 @@ def _args(argv):
     p.add_argument("--out", type=Path, help="output dir (default <run>/analysis; required with several runs)")
     p.add_argument(
         "--exclude-degraded", default="", metavar="SCENARIO,...",
-        help="drop reps with degraded_s > 0 in these scenarios (host noise; only without injected loss or jitter)",
+        help="drop reps with degraded_s > 0 or cpu_outlier in these scenarios (host noise; only without injected loss or jitter)",
     )
     try:
         args = p.parse_args(argv)
@@ -525,11 +539,14 @@ def main(argv: list[str]) -> int:
     _check_runs(found)
 
     reps = pd.DataFrame([row for row, _, _, _ in found])
+    reps["cpu_outlier"] = cpu_outlier(reps)
+    for r in reps[reps.cpu_outlier].itertuples():
+        _warn(f"{r.scenario}/{r.transport}/rep-{r.rep}: cpu_outlier (cpu_per_krps={r.cpu_per_krps:.1f}, run {r.run})")
     noisy = {s for s in args.exclude_degraded.split(",") if s}
-    reps["excluded"] = reps.scenario.isin(noisy) & (reps.degraded_s > 0)
+    reps["excluded"] = reps.scenario.isin(noisy) & ((reps.degraded_s > 0) | reps.cpu_outlier)
     n_excluded = reps.groupby(KEYS).excluded.sum()
     for (scenario, transport), n in n_excluded[n_excluded > 0].items():
-        _warn(f"{scenario}/{transport}: {n} rep(s) excluded (degraded_s > 0)")
+        _warn(f"{scenario}/{transport}: {n} rep(s) excluded (degraded_s > 0 or cpu_outlier)")
     kept = reps[~reps.excluded]
     curves, series = {}, []
     for (row, curve, entry, _), excluded in zip(found, reps.excluded):

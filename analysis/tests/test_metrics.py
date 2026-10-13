@@ -273,7 +273,7 @@ def test_comparison_ratio_only_for_throughput():
     assert math.isnan(analyze.comparison(reps).iloc[0].ratio)
 
 
-def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, names=("server",)):
+def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, names=("server",), cpu=10):
     """100 rps for n/100 s; requests started inside outage=(start_s, end_s) fail.
     hops: {"svc-<name>.json": {peer: dials}}; names: service containers in stats.csv, each at 10%."""
     d.mkdir(parents=True)
@@ -291,9 +291,9 @@ def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, nam
         f' "load": {{"rps": {rps}, "duration_ns": {n // 100 * S}, "deadline_ns": {2 * S}}}}}'
     )
     stats = ["ts_ns,name,cpu_perc,mem_usage\n"]  # the idle sample before the measured window is ignored
-    for ts, cpu, mem in [(t0 - S, 0, 0), (t0 + S, 10, 10)]:
-        stats += [f"{ts},bench-{c}-1,{cpu}%,{mem}MiB / 1GiB\n" for c in names]
-        stats.append(f"{ts},bench-loadgen,{3 * cpu}%,{2 * mem}MiB / 1GiB\n")
+    for ts, pct, mem in [(t0 - S, 0, 0), (t0 + S, cpu, 10)]:
+        stats += [f"{ts},bench-{c}-1,{pct}%,{mem}MiB / 1GiB\n" for c in names]
+        stats.append(f"{ts},bench-loadgen,{3 * pct}%,{2 * mem}MiB / 1GiB\n")
     (d / "stats.csv").write_text("".join(stats))
     for name, dials_by_peer in (hops or {}).items():
         (d / name).write_text(json.dumps({"service": name, "dials": dials_by_peer, "counters": {}}))
@@ -481,3 +481,43 @@ def test_rpc_cpu(tmp_path):
     row = s.loc[("s1-baseline", "h3")]
     assert row["rpc_cpu_mean"] == pytest.approx(30.0)  # gateway + core + ledger, not postgres
     assert row["cpu_per_krps_mean"] == pytest.approx(30.0 / (row["ok_rps_mean"] / 1000))
+
+
+def outlier_reps(cpus):
+    return pd.DataFrame({"scenario": "s1-baseline", "transport": "h2", "run": "r", "rep": range(1, len(cpus) + 1),
+                         "cpu_per_krps": cpus})
+
+
+def test_cpu_outlier_flags_the_noisy_rep():
+    cpus = [39, 40, 41, 40, 39, 41, 40, 40, 39, 41, 60]
+    assert list(analyze.cpu_outlier(outlier_reps(cpus))) == [False] * 10 + [True]
+
+
+def test_cpu_outlier_without_spread():
+    assert not analyze.cpu_outlier(outlier_reps([40.0] * 5)).any()  # MAD = 0: nothing flagged, no division
+
+
+def test_cpu_outlier_per_run_and_transport():
+    a = outlier_reps([40, 40, 41, 39, 40])
+    b = outlier_reps([80, 81, 79, 80, 80]).assign(transport="h3")  # h3 costs more: not an outlier of h2
+    assert not analyze.cpu_outlier(pd.concat([a, b], ignore_index=True)).any()
+
+
+def test_main_exclude_cpu_outlier(tmp_path, capsys):
+    for t in ["h2", "h3"]:
+        for r in range(1, 6):
+            write_rep(tmp_path / "s1-baseline" / t / f"rep-{r}", t, cpu=20 + r % 2)
+    write_rep(tmp_path / "s1-baseline" / "h2" / "rep-6", "h2", cpu=50)  # host noise: same load, 2.4x the CPU
+    assert analyze.main([str(tmp_path), "--exclude-degraded=s1-baseline"]) == 0
+    err = capsys.readouterr().err
+    assert "s1-baseline/h2/rep-6: cpu_outlier" in err
+    reps = pd.read_csv(tmp_path / "analysis" / "reps.csv")
+    assert reps.cpu_outlier.sum() == 1 and reps.excluded.sum() == 1
+    s = pd.read_csv(tmp_path / "analysis" / "summary.csv").set_index(["scenario", "transport"])
+    assert s.loc[("s1-baseline", "h2"), "n"] == 5 and s.loc[("s1-baseline", "h2"), "n_excluded"] == 1
+
+
+def test_cpu_outlier_ignores_missing_cpu():
+    # reps without stats.csv have no cpu_per_krps: never flagged
+    assert not analyze.cpu_outlier(outlier_reps([float("nan")] * 3)).any()
+    assert not analyze.cpu_outlier(outlier_reps([40.0, 40.0, float("nan")])).any()
