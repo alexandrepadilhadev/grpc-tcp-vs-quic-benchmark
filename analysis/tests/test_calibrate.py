@@ -93,3 +93,14 @@ def test_late_starts_are_reported_not_judged(tmp_path):
 def test_table_counts_cpu_outliers(tmp_path):
     run = calib_run(tmp_path, 250, [("h3", {"cpu_outlier": True}), ("h3", {"cpu_outlier": False})])
     assert calibrate.table([run]).set_index(["rate", "transport"]).loc[(250, "h3"), "cpu_outliers"] == 1
+
+
+def test_rate_with_skipped_reps_does_not_serve(tmp_path, capsys):
+    # analyze drops failed reps (failures.log, dials != 1): the survivors alone must not make C
+    runs = [
+        calib_run(tmp_path, 250, [("h3", {}), ("h3", {}), ("h3", {})]),
+        calib_run(tmp_path, 500, [("h3", {"served_frac": 0.995})]),  # 2 of 3 reps skipped
+    ]
+    assert calibrate.capacity(calibrate.table(runs)) == 250
+    assert calibrate.main([str(r) for r in runs]) == 0
+    assert "500 h3: 1 of 3 reps" in capsys.readouterr().err

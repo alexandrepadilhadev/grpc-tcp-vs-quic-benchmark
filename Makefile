@@ -43,14 +43,16 @@ fitness: build
 	mkdir -p results
 	bash scripts/run.sh fitness
 
-# load calibration (spec §9): s1-baseline x REPS=3 per rate into results/calib-<rate>-<time>/, then the report
+# load calibration (spec §9): s1-baseline x REPS=3 per rate into results/calib-<sweep>-<rate>-<time>/,
+# then the report of this sweep only (sweeps on other days cost different CPU)
 RATES ?= 250 500 750 1000 1500
+SWEEP := $(shell date +%Y%m%d%H%M%S)
 calibrate: build $(FIT)
 	mkdir -p results
 	for r in $(RATES); do \
-		LOADGEN_EXTRA=--rps=$$r RUN_PREFIX=calib-$$r- SCENARIOS=s1-baseline REPS=3 bash scripts/run.sh || exit 1; \
+		LOADGEN_EXTRA=--rps=$$r RUN_PREFIX=calib-$(SWEEP)-$$r- SCENARIOS=s1-baseline REPS=3 bash scripts/run.sh || exit 1; \
 	done
-	$(MAKE) calibrate-report
+	$(MAKE) calibrate-report CALIB='calib-$(SWEEP)-*'
 
 # CALIB=<glob under results/> picks the sweep (default: every calib-* run)
 CALIB ?= calib-*

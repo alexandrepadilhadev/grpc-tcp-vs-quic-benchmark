@@ -148,9 +148,15 @@ fitness() {
 	LOADGEN_EXTRA="--rps=250 --duration=30s --warmup=10s" \
 		bash scripts/run.sh rep experiments/scenarios/s1-baseline.env h2 "$root/s1-baseline/h2/rep-1" ||
 		die "fitness repetition failed (see $root)"
-	"${COMPOSE[@]}" run --rm --build analysis "/$root" >/dev/null 2>&1 || die "fitness analysis failed (see $root)"
-	"${COMPOSE[@]}" run --rm --entrypoint python analysis fitness.py "/$root" ${FITNESS_MAX:+--max "$FITNESS_MAX"} ||
-		die "host degraded: do not start a long run (see $root)"
+	"${COMPOSE[@]}" run --rm --build analysis "/$root" >"$root/analyze.log" 2>&1 ||
+		die "fitness analysis failed (see $root/analyze.log)"
+	local rc=0
+	"${COMPOSE[@]}" run --rm --entrypoint python analysis fitness.py "/$root" ${FITNESS_MAX:+--max "$FITNESS_MAX"} || rc=$?
+	case $rc in
+	0) ;;
+	1) die "host degraded: do not start a long run (see $root)" ;;
+	*) die "fitness had nothing to judge, e.g. no CPU samples (see $root/analyze.log)" ;;
+	esac
 }
 
 case "${1:-}" in

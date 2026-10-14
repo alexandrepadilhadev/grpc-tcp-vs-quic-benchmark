@@ -59,9 +59,17 @@ def table(runs: list[Path]) -> pd.DataFrame:
 
 def capacity(t: pd.DataFrame) -> int | None:
     """C: the highest rate where h3 (the CPU worst case) serves the demand,
-    the saturation capacity the POC's 40% rule refers to."""
-    ok = t[(t.transport == "h3") & (t.served_frac_min >= SERVED_MIN)]
+    the saturation capacity the POC's 40% rule refers to. A rate with fewer valid
+    reps than the sweep ran (analyze skipped failed ones) does not serve."""
+    ok = t[(t.transport == "h3") & (t.served_frac_min >= SERVED_MIN) & (t.n == t.n.max())]
     return int(ok.rate.max()) if len(ok) else None
+
+
+def short_rates(t: pd.DataFrame) -> list[str]:
+    """Rows with fewer valid reps than the sweep ran, as warnings."""
+    full = t.n.max()
+    return [f"{r.rate} {r.transport}: {r.n} of {full} reps valid (see analyze warnings)"
+            for r in t.itertuples() if r.n < full]
 
 
 def high_rate(c: int) -> int:
@@ -81,6 +89,8 @@ def main(argv: list[str]) -> int:
         return 2
     t = table([Path(a) for a in argv])
     print(markdown(t))
+    for w in short_rates(t):
+        print(f"calibrate: {w}", file=sys.stderr)
     c = capacity(t)
     if c is None:
         print("calibrate: no rate serves the demand for h3; sweep lower rates", file=sys.stderr)
