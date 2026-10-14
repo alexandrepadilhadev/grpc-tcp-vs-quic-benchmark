@@ -27,6 +27,7 @@ COMPARE = [
 RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
 RPC_SERVICES = ["gateway", "core", "ledger"]  # the gRPC services whose CPU makes rpc_cpu
 SVC_REPORTS = ["gateway", "core", "ledger", "risk"]  # svc-<name>.json each payment repetition must have
+CPU_OUTLIER_MIN = 0.20  # cpu_outlier also needs +20% over the median (host noise seen: 2.3x)
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -403,14 +404,18 @@ def hop_problems(d) -> list[str]:
 
 def cpu_outlier(reps: pd.DataFrame) -> pd.Series:
     """True for reps whose cpu_per_krps is above the median + 3 MAD of their run x scenario x
-    transport: host noise makes the same load cost more CPU without lowering the throughput,
-    which degraded_s cannot see. MAD 0 (or no CPU data) flags nothing."""
+    transport and at least CPU_OUTLIER_MIN above the median: host noise makes the same load
+    cost more CPU without lowering the throughput, which degraded_s cannot see. The floor keeps
+    a very stable group (tiny MAD) from flagging a few percent. MAD 0 (or no CPU data) flags nothing."""
     if "cpu_per_krps" not in reps:
         return pd.Series(False, index=reps.index)
 
     def flag(x):
-        mad = (x - x.median()).abs().median()
-        return x > x.median() + 3 * mad if mad > 0 else pd.Series(False, index=x.index)
+        med = x.median()
+        mad = (x - med).abs().median()
+        if not mad > 0:
+            return pd.Series(False, index=x.index)
+        return (x > med + 3 * mad) & (x > med * (1 + CPU_OUTLIER_MIN))
 
     return reps.groupby(["run"] + KEYS, group_keys=False).cpu_per_krps.apply(flag).reindex(reps.index).astype(bool)
 

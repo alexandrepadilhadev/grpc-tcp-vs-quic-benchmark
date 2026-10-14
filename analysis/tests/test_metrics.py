@@ -521,3 +521,9 @@ def test_cpu_outlier_ignores_missing_cpu():
     # reps without stats.csv have no cpu_per_krps: never flagged
     assert not analyze.cpu_outlier(outlier_reps([float("nan")] * 3)).any()
     assert not analyze.cpu_outlier(outlier_reps([40.0, 40.0, float("nan")])).any()
+
+
+def test_cpu_outlier_needs_a_real_jump():
+    # a very stable group has a tiny MAD: +6% is above median + 3 MAD but is not host noise (2x seen)
+    assert not analyze.cpu_outlier(outlier_reps([312.4, 314.5, 330.1])).any()
+    assert list(analyze.cpu_outlier(outlier_reps([133.4, 134.6, 166.8]))) == [False, False, True]  # +24%

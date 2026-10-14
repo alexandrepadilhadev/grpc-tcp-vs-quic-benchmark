@@ -41,16 +41,17 @@ def test_table_aggregates_reps(tmp_path):
     assert row["data_cpu_max"] == pytest.approx(35)  # risk + rabbitmq + postgres share CPU 5
 
 
-def test_capacity_is_the_highest_passing_h3_rate(tmp_path):
+def test_capacity_is_the_highest_h3_rate_serving_the_demand(tmp_path):
+    # C is saturation, as in the POC: health (CPU, p50) does not decide it, the high rate's check does
     runs = [
         calib_run(tmp_path, 250, [("h3", {}), ("h2", {})]),
-        calib_run(tmp_path, 500, [("h3", {"gateway_cpu": 69}), ("h2", {})]),
-        calib_run(tmp_path, 750, [("h3", {"gateway_cpu": 71}), ("h2", {})]),  # one container over 70%
-        calib_run(tmp_path, 1000, [("h3", {}), ("h2", {"gateway_cpu": 99})]),  # passes: only h3 decides
+        calib_run(tmp_path, 750, [("h3", {"gateway_cpu": 85}), ("h2", {})]),  # unhealthy, still served
+        calib_run(tmp_path, 1000, [("h3", {"served_frac": 0.995}), ("h2", {"served_frac": 0.5})]),  # only h3 decides
+        calib_run(tmp_path, 1500, [("h3", {"served_frac": 0.94}), ("h2", {})]),  # saturated
     ]
-    t = calibrate.table(runs)
-    assert calibrate.capacity(t) == 1000
-    assert not t.set_index(["rate", "transport"]).loc[(750, "h3"), "pass"]
+    t = calibrate.table(runs).set_index(["rate", "transport"])
+    assert calibrate.capacity(t.reset_index()) == 1000
+    assert not t.loc[(750, "h3"), "healthy"] and t.loc[(250, "h3"), "healthy"]
 
 
 @pytest.mark.parametrize("over", [
@@ -58,9 +59,10 @@ def test_capacity_is_the_highest_passing_h3_rate(tmp_path):
     {"p50": 1.51},  # > 1.5x the p50 of the lowest rate
     {"postgres_cpu": 30, "rabbitmq_cpu": 30, "risk_cpu": 11},  # CPU 5 summed: 71%
 ])
-def test_each_rule_fails_a_rate(tmp_path, over):
+def test_each_rule_marks_a_rate_unhealthy(tmp_path, over):
     runs = [calib_run(tmp_path, 250, [("h3", {})]), calib_run(tmp_path, 500, [("h3", over)])]
-    assert calibrate.capacity(calibrate.table(runs)) == 250
+    t = calibrate.table(runs).set_index(["rate", "transport"])
+    assert t.loc[(250, "h3"), "healthy"] and not t.loc[(500, "h3"), "healthy"]
 
 
 def test_high_rate():
@@ -68,10 +70,10 @@ def test_high_rate():
     assert calibrate.high_rate(1130) == 450  # 0.4 x C, down to a multiple of 50
 
 
-def test_main_without_a_passing_rate(tmp_path, capsys):
+def test_main_without_a_served_rate(tmp_path, capsys):
     run = calib_run(tmp_path, 250, [("h3", {"served_frac": 0.5})])
     assert calibrate.main([str(run)]) == 1
-    assert "no rate passes" in capsys.readouterr().err
+    assert "no rate serves the demand" in capsys.readouterr().err
 
 
 def test_main_prints_table_and_rates(tmp_path, capsys):
@@ -84,9 +86,8 @@ def test_main_prints_table_and_rates(tmp_path, capsys):
 def test_late_starts_are_reported_not_judged(tmp_path):
     # at low rates the VM's timer wake-ups delay starts without any saturation (spec §9)
     runs = [calib_run(tmp_path, 250, [("h3", {})]), calib_run(tmp_path, 500, [("h3", {"late_starts": 900})])]
-    t = calibrate.table(runs)
-    assert calibrate.capacity(t) == 500
-    assert t.set_index(["rate", "transport"]).loc[(500, "h3"), "late_starts_max"] == 900
+    t = calibrate.table(runs).set_index(["rate", "transport"])
+    assert t.loc[(500, "h3"), "healthy"] and t.loc[(500, "h3"), "late_starts_max"] == 900
 
 
 def test_table_counts_cpu_outliers(tmp_path):

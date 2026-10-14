@@ -1,6 +1,7 @@
 """Load calibration (payment spec §9): one row per rate x transport from the
-s1-baseline sweep (make calibrate, then make analyze on each run) and the rates
-the spec's rules give.
+s1-baseline sweep (make calibrate, then make analyze on each run), the capacity C
+(the highest rate h3 still serves) and the high rate 0.4 x C. "healthy" (CPU and
+p50 rules) is the check the chosen rate must pass, not what defines C.
 
 usage: python calibrate.py <calib run dir>...
 """
@@ -48,7 +49,7 @@ def table(runs: list[Path]) -> pd.DataFrame:
         **{f"{c}_max": g[c].max() for c in cpu},
     }).reset_index()
     base = t.sort_values("rate").groupby("transport").p50_median.transform("first")
-    t["pass"] = (
+    t["healthy"] = (
         (t.served_frac_min >= SERVED_MIN)
         & (t.p50_median <= P50_MAX * base)
         & (t[[f"{c}_max" for c in cpu]].max(axis=1) <= CPU_MAX)
@@ -57,8 +58,9 @@ def table(runs: list[Path]) -> pd.DataFrame:
 
 
 def capacity(t: pd.DataFrame) -> int | None:
-    """C: the highest rate where h3 (the CPU worst case) passes every rule."""
-    ok = t[(t.transport == "h3") & t["pass"]]
+    """C: the highest rate where h3 (the CPU worst case) serves the demand,
+    the saturation capacity the POC's 40% rule refers to."""
+    ok = t[(t.transport == "h3") & (t.served_frac_min >= SERVED_MIN)]
     return int(ok.rate.max()) if len(ok) else None
 
 
@@ -81,9 +83,10 @@ def main(argv: list[str]) -> int:
     print(markdown(t))
     c = capacity(t)
     if c is None:
-        print("calibrate: no rate passes every rule for h3; sweep lower rates", file=sys.stderr)
+        print("calibrate: no rate serves the demand for h3; sweep lower rates", file=sys.stderr)
         return 1
-    print(f"\nC = {c} RPC/s (h3)\nhigh rate = {high_rate(c)} RPC/s")
+    print(f"\nC = {c} RPC/s (h3 serves >= {SERVED_MIN:.0%})\nhigh rate = {high_rate(c)} RPC/s"
+          " (check: s1 h3 at that rate must be healthy)")
     return 0
 
 
