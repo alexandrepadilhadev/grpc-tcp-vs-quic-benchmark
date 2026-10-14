@@ -3,6 +3,7 @@
 #   bash scripts/run.sh                              every scenario x {h2,h3} x REPS
 #   bash scripts/run.sh rep <env> <transport> <dir>  one repetition (own process)
 #   bash scripts/run.sh trace <transport> [scenario] debug-level trace run + timeline.txt
+#   bash scripts/run.sh fitness                      fails on a degraded host (s1 h2, 250 RPC/s, ~2 min)
 # Env: SCENARIOS (glob over experiments/scenarios, default *), REPS (default 5),
 # RUN_PREFIX (prefix of the run folder), LOADGEN_EXTRA (flags appended to the
 # scenario's LOADGEN_ARGS; the last value of a flag wins), OUTAGE_SVC (default gateway),
@@ -137,8 +138,24 @@ trace() {
 	echo "trace_dir=$dir"
 }
 
+# fitness runs one short s1-baseline h2 repetition at 250 RPC/s into results/fitness-<time>/
+# and fails when its CPU per 1000 RPC/s shows a degraded host (spec §9): a long run
+# must not start there. FITNESS_MAX overrides the limit of analysis/fitness.py.
+fitness() {
+	local root
+	[[ -f certs/server.crt ]] || die "certs/server.crt missing: run make certs"
+	root=results/fitness-$(date +%Y-%m-%d-%H-%M-%S)
+	LOADGEN_EXTRA="--rps=250 --duration=30s --warmup=10s" \
+		bash scripts/run.sh rep experiments/scenarios/s1-baseline.env h2 "$root/s1-baseline/h2/rep-1" ||
+		die "fitness repetition failed (see $root)"
+	"${COMPOSE[@]}" run --rm --build analysis "/$root" >/dev/null 2>&1 || die "fitness analysis failed (see $root)"
+	"${COMPOSE[@]}" run --rm --entrypoint python analysis fitness.py "/$root" ${FITNESS_MAX:+--max "$FITNESS_MAX"} ||
+		die "host degraded: do not start a long run (see $root)"
+}
+
 case "${1:-}" in
 "") matrix ;;
+fitness) fitness ;;
 trace)
 	[[ $# -ge 2 && $# -le 3 ]] || die "usage: run.sh trace <transport> [scenario]"
 	trace "$2" "${3:-}"
@@ -148,5 +165,5 @@ rep)
 	export TRANSPORT=$3
 	rep "$2" "$4"
 	;;
-*) die "usage: run.sh [rep <env> <transport> <dir> | trace <transport> [scenario]]" ;;
+*) die "usage: run.sh [rep <env> <transport> <dir> | trace <transport> [scenario] | fitness]" ;;
 esac
