@@ -31,6 +31,7 @@ type Config struct {
 	MaxConcurrentStreams uint32        // server
 	ShutdownTimeout      time.Duration // server
 	CAFile               string        // client
+	Migratable           bool          // client: no flag nor env; enables Client.Migrate
 
 	envErr error // invalid env values, reported by Validate
 }
