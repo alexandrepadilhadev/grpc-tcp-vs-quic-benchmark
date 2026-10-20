@@ -23,6 +23,7 @@ QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
 COMPARE = [
     "p50", "p99", "p999", "p50_all", "p99_all", "p999_all", "error_rate", "ok_rps", "served_frac", "recovery_s", "cpu_per_krps", "handshake_ms",
+    "orphans", "orphan_share",
 ]
 RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
 RPC_SERVICES = ["gateway", "core", "ledger"]  # the gRPC services whose CPU makes rpc_cpu
@@ -420,6 +421,21 @@ def cpu_outlier(reps: pd.DataFrame) -> pd.Series:
     return reps.groupby(["run"] + KEYS, group_keys=False).cpu_per_krps.apply(flag).reindex(reps.index).astype(bool)
 
 
+def orphans(d) -> dict:
+    """Payments the ledger settled while the client saw an error: the ledger's committed
+    count minus the RPCs answered ok (every phase, plus the probe). orphan_share divides by
+    the failed RPCs (NaN without failures). Empty without the ledger counter (older runs)."""
+    try:
+        settled = json.loads((d / "svc-ledger.json").read_text())["counters"]["settled"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    status = pd.read_csv(d / "requests.csv", usecols=["status"]).status
+    ok = int((status == "ok").sum())
+    failed = len(status) - ok
+    n = settled - ok - 1  # 1: the probe, answered ok and not in requests.csv
+    return {"orphans": n, "orphan_share": n / failed if failed else np.nan}
+
+
 def _rep_row(d, name):
     """Metrics of one repetition dir, or None when it is not valid."""
     meta_path = d / "meta.json"
@@ -449,6 +465,7 @@ def _rep_row(d, name):
     row.update(throughput(df))
     row["error_rate"] = error_rate(df)
     row["served_frac"] = served_frac(meta)
+    row.update(orphans(d))
     if (d / "stats.csv").exists():
         end = df.start_ns + df.latency_us * 1000
         row.update(_container_stats(d / "stats.csv", df.start_ns.min(), end.max()))

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 
 	"connectrpc.com/connect"
 
@@ -28,11 +29,18 @@ type Store interface {
 
 // Handler implements paymentv1connect.LedgerServiceHandler.
 type Handler struct {
-	store Store
-	log   *slog.Logger
+	store             Store
+	log               *slog.Logger
+	settled, declined atomic.Int64 // committed outcomes, for the shutdown report
 }
 
 func New(s Store, log *slog.Logger) *Handler { return &Handler{store: s, log: log} }
+
+// Counters are the committed outcomes so far: settled and declined payments.
+// With no retries in the system, settled counts distinct payments.
+func (h *Handler) Counters() map[string]int64 {
+	return map[string]int64{"settled": h.settled.Load(), "declined": h.declined.Load()}
+}
 
 func (h *Handler) Settle(ctx context.Context, req *connect.Request[paymentv1.SettleRequest]) (*connect.Response[paymentv1.SettleResponse], error) {
 	m := req.Msg
@@ -56,6 +64,11 @@ func (h *Handler) Settle(ctx context.Context, req *connect.Request[paymentv1.Set
 			return nil, connect.NewError(connect.CodeCanceled, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if st == paymentv1.PaymentStatus_PAYMENT_STATUS_SETTLED {
+		h.settled.Add(1)
+	} else {
+		h.declined.Add(1)
 	}
 	if debug {
 		msg := "debit applied"

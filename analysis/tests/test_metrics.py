@@ -527,3 +527,32 @@ def test_cpu_outlier_needs_a_real_jump():
     # a very stable group has a tiny MAD: +6% is above median + 3 MAD but is not host noise (2x seen)
     assert not analyze.cpu_outlier(outlier_reps([312.4, 314.5, 330.1])).any()
     assert list(analyze.cpu_outlier(outlier_reps([133.4, 134.6, 166.8]))) == [False, False, True]  # +24%
+
+
+def orphan_rep(tmp_path, transport, settled):
+    """s5-like rep: 500 RPCs, 100 failed in the outage; the ledger committed `settled`."""
+    d = tmp_path / "s5-outage" / transport / "rep-1"
+    write_rep(d, transport, outage=(1, 2), hops=HOPS)
+    (d / "svc-ledger.json").write_text(json.dumps({"service": "ledger", "dials": {}, "counters": {"settled": settled}}))
+    return d
+
+
+def test_orphans_are_settled_payments_the_client_saw_fail(tmp_path):
+    # 400 ok + the probe were answered; 30 more were settled while the client saw an error
+    for t, settled in [("h2", 431), ("h3", 401)]:
+        orphan_rep(tmp_path, t, settled)
+    assert analyze.main([str(tmp_path)]) == 0
+    r = pd.read_csv(tmp_path / "analysis" / "reps.csv").set_index("transport")
+    assert r.loc["h2", "orphans"] == 30 and r.loc["h2", "orphan_share"] == pytest.approx(0.3)
+    assert r.loc["h3", "orphans"] == 0 and r.loc["h3", "orphan_share"] == 0
+    c = pd.read_csv(tmp_path / "analysis" / "comparison.csv")
+    assert "orphans" in set(c.metric)
+
+
+def test_orphans_need_the_ledger_counter(tmp_path):
+    # runs before the counter existed: no orphans column value, no crash
+    for t in ["h2", "h3"]:
+        write_rep(tmp_path / "s1-baseline" / t / "rep-1", t, hops=HOPS)
+    assert analyze.main([str(tmp_path)]) == 0
+    r = pd.read_csv(tmp_path / "analysis" / "reps.csv")
+    assert "orphans" not in r or r.orphans.isna().all()

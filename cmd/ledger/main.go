@@ -61,7 +61,8 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("database: %w", err)
 	}
 	defer store.Close()
-	path, h := paymentv1connect.NewLedgerServiceHandler(ledger.New(store, log), service.HandlerOptions(log)...)
+	handler := ledger.New(store, log)
+	path, h := paymentv1connect.NewLedgerServiceHandler(handler, service.HandlerOptions(log)...)
 	srv, err := service.Listen("ledger", version, c.Transport, log, path, h)
 	if err != nil {
 		return err
@@ -69,5 +70,6 @@ func run(ctx context.Context, args []string) error {
 	err = srv.Serve(ctx)
 	log.Info("ledger stopped", "error", err)
 	return errors.Join(err, service.WriteReport(c.RepDir, service.Report{
-		Service: "ledger", Version: version, Transport: c.Transport.Transport.String(), Dials: map[string]int64{}}))
+		Service: "ledger", Version: version, Transport: c.Transport.Transport.String(),
+		Dials: map[string]int64{}, Counters: handler.Counters()}))
 }

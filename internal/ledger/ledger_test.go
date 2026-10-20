@@ -109,3 +109,23 @@ func TestMemStoreConcurrentSameAccount(t *testing.T) {
 		t.Fatalf("balance %d entries %d", s.Balance(7), s.Entries())
 	}
 }
+
+// TestCounters: the ledger reports what it committed, so the analysis can find
+// payments the system settled while the client saw an error (orphans).
+func TestCounters(t *testing.T) {
+	h, _ := newHandler()
+	for _, id := range []string{"p1", "p2"} {
+		if st, err := settle(t, h, id, 3, 1000); err != nil || st != settled {
+			t.Fatalf("%s: status %v err %v", id, st, err)
+		}
+	}
+	if st, err := settle(t, h, "p3", 3, 1_000_000); err != nil || st != declined {
+		t.Fatalf("p3: status %v err %v", st, err)
+	}
+	if _, err := settle(t, h, "p4", 3, 0); err == nil {
+		t.Fatal("invalid payment accepted")
+	}
+	if got := h.Counters(); got["settled"] != 2 || got["declined"] != 1 || len(got) != 2 {
+		t.Fatalf("counters = %v; want settled 2, declined 1", got)
+	}
+}
