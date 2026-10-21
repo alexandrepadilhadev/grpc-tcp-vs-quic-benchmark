@@ -273,9 +273,11 @@ def test_comparison_ratio_only_for_throughput():
     assert math.isnan(analyze.comparison(reps).iloc[0].ratio)
 
 
-def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, names=("server",), cpu=10):
+def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, names=("server",), cpu=10,
+              migration=None, peers=None):
     """100 rps for n/100 s; requests started inside outage=(start_s, end_s) fail.
-    hops: {"svc-<name>.json": {peer: dials}}; names: service containers in stats.csv, each at 10%."""
+    hops: {"svc-<name>.json": {peer: dials}}; names: service containers in stats.csv, each at 10%.
+    migration: {"at_s", "ok"} -> meta migrations/migrate_to and the s4 events.csv; peers: gateway peers."""
     d.mkdir(parents=True)
     t0 = 1_700_000_000 * S
     lines = [HEADER]
@@ -288,6 +290,7 @@ def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, nam
     (d / "meta.json").write_text(
         f'{{"transport": "{transport}", "dials": {dials}, "interrupted": false,'
         f' "handshake_us": 4000, "ok": {n // 2}, "unsent": 0,'
+        + (' "migrations": 1, "migrate_to": "10.10.0.250",' if migration else "") +
         f' "load": {{"rps": {rps}, "duration_ns": {n // 100 * S}, "deadline_ns": {2 * S}}}}}'
     )
     stats = ["ts_ns,name,cpu_perc,mem_usage\n"]  # the idle sample before the measured window is ignored
@@ -296,7 +299,15 @@ def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, nam
         stats.append(f"{ts},bench-loadgen,{3 * pct}%,{2 * mem}MiB / 1GiB\n")
     (d / "stats.csv").write_text("".join(stats))
     for name, dials_by_peer in (hops or {}).items():
-        (d / name).write_text(json.dumps({"service": name, "dials": dials_by_peer, "counters": {}}))
+        rep = {"service": name, "dials": dials_by_peer, "counters": {}}
+        if name == "svc-gateway.json" and peers is not None:
+            rep["peers"] = peers
+        (d / name).write_text(json.dumps(rep))
+    if migration:
+        m = int(t0 + migration["at_s"] * S)
+        end = "migrated" if migration["ok"] else "migrate_failed"
+        (d / "events.csv").write_text(
+            f"event,ts_ns\nip_added,{m - 1}\nmigrate_start,{m}\n{end},{m + 1_000_000}\nip_removed,{m + 2_000_000}\n")
     if outage:
         a, b = (int(t0 + x * S) for x in outage)
         (d / "events.csv").write_text(f"event,ts_ns\noutage_start,{a}\noutage_end,{b}\n")
@@ -473,6 +484,66 @@ def test_main_without_hop_files_uses_meta_only(tmp_path):
     assert s.loc[("s1-baseline", "h2"), "n"] == 1 and s.loc[("s1-baseline", "h3"), "n"] == 1
 
 
+PEERS = {"10.10.0.5": 4512, "10.10.0.250": 2990}
+
+
+def s4_run(tmp_path, transport, ok, dials, peers=PEERS):
+    write_rep(tmp_path / "s4-migration" / transport / "rep-1", transport, dials=dials, hops=HOPS,
+              migration={"at_s": 2, "ok": ok}, peers=peers)
+    assert analyze.main([str(tmp_path)]) in (0, 1)
+
+
+def s4_valid(tmp_path):
+    return (tmp_path / "analysis" / "reps.csv").exists()
+
+
+def test_s4_h2_two_dials_is_valid(tmp_path):
+    s4_run(tmp_path, "h2", ok=True, dials=2)
+    assert s4_valid(tmp_path)
+
+
+def test_s4_h3_migrated_two_dials_is_skipped(tmp_path, capsys):
+    s4_run(tmp_path, "h3", ok=True, dials=2)
+    assert not s4_valid(tmp_path)
+    assert "dials=2, expected 1, skipped" in capsys.readouterr().err
+
+
+def test_s4_h3_failed_migration_two_dials_is_valid(tmp_path):
+    s4_run(tmp_path, "h3", ok=False, dials=2)
+    assert s4_valid(tmp_path)
+
+
+def test_s4_without_new_ip_in_peers_is_skipped(tmp_path, capsys):
+    s4_run(tmp_path, "h3", ok=True, dials=1, peers={"10.10.0.5": 4512})
+    assert not s4_valid(tmp_path)
+    assert "migration not seen by the gateway, skipped" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("transport", ["h2", "h3"])
+def test_s4_without_migrate_start_is_skipped(tmp_path, capsys, transport):
+    d = tmp_path / "s4-migration" / transport / "rep-1"
+    write_rep(d, transport, dials=1, hops=HOPS, migration={"at_s": 2, "ok": True}, peers=PEERS)
+    (d / "events.csv").unlink()
+    assert analyze.main([str(tmp_path)]) == 1
+    assert "migrations=1 but no migrate_start in events.csv, skipped" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("content", ["", "foo,bar\n1,2\n", "event,x\na,1\n"])
+def test_bad_events_csv_skips_only_that_rep(tmp_path, capsys, content):
+    for r in [1, 2]:
+        write_rep(tmp_path / "s1-baseline" / "h2" / f"rep-{r}", "h2")
+    (tmp_path / "s1-baseline" / "h2" / "rep-2" / "events.csv").write_text(content)
+    assert analyze.main([str(tmp_path)]) == 0
+    assert pd.read_csv(tmp_path / "analysis" / "summary.csv").n[0] == 1
+    assert "events.csv unreadable, skipped" in capsys.readouterr().err
+
+
+def test_main_outage_events_unchanged(tmp_path):
+    write_rep(tmp_path / "s5-outage" / "h2" / "rep-1", "h2", outage=(1, 2))
+    assert analyze.main([str(tmp_path)]) == 0
+    assert pd.read_csv(tmp_path / "analysis" / "summary.csv").recovery_s_mean[0] == pytest.approx(0.0)
+
+
 def test_rpc_cpu(tmp_path):
     for t in ["h2", "h3"]:
         write_rep(tmp_path / "s1-baseline" / t / "rep-1", t, names=("gateway", "core", "ledger", "postgres"))
@@ -556,3 +627,83 @@ def test_orphans_need_the_ledger_counter(tmp_path):
     assert analyze.main([str(tmp_path)]) == 0
     r = pd.read_csv(tmp_path / "analysis" / "reps.csv")
     assert "orphans" not in r or r.orphans.isna().all()
+
+
+def completions(ms_list, status="ok"):
+    """measure rows completing at the given Unix ns (latency 0)."""
+    return frame([(i, 0, t, 0, status, 1, 1, "measure") for i, t in enumerate(ms_list)])
+
+
+def test_max_gap_ms():
+    t0 = 1_700_000_000 * S
+    ms = 1_000_000
+    ok = [t0 + i * 10 * ms for i in range(0, 50)] + [t0 + 690 * ms + i * 10 * ms for i in range(0, 30)]  # hole 490..690
+    df = pd.concat([completions(ok), completions([t0 + 300 * ms], "unavailable")], ignore_index=True)
+    assert analyze.max_gap_ms(df, t0, t0 + 980 * ms) == pytest.approx(200.0)
+    assert analyze.max_gap_ms(df, t0 + 100 * ms, t0 + 300 * ms) == pytest.approx(10.0)  # not-ok row ignored
+    assert analyze.max_gap_ms(df, t0 + 10 * 1000 * ms, t0 + 10 * 1000 * ms + 500 * ms) == pytest.approx(500.0)  # no ok inside
+    far = completions([t0 + 5000 * ms])  # outside the window: ignored; edges count as completions
+    assert analyze.max_gap_ms(far, t0, t0 + 100 * ms) == pytest.approx(100.0)
+
+
+def migration_df(t_m):
+    ms = 1_000_000
+    ok = [t_m + i * 10 * ms for i in range(-1500, 2500) if not 1 <= i <= 4]  # hole: t_m .. t_m + 50 ms
+    bad = completions([t_m + 1 * S, t_m + 2 * S], "unavailable")
+    early = completions([t_m - 3 * S, t_m + 6 * S], "unavailable")  # outside [t_m - 1 s, t_m + 5 s]
+    return pd.concat([completions(ok), bad, early], ignore_index=True)
+
+
+def test_migration_metrics():
+    t_m = 1_700_000_030 * S
+    df = migration_df(t_m)
+    ev = pd.Series({"migrate_start": t_m, "migrated": t_m + 1_000_000})
+    m = analyze.migration_metrics(df, ev, {"transport": "h3", "dials": 1})
+    assert m == {"interrupt_ms": pytest.approx(50.0), "gap_base_ms": pytest.approx(10.0),
+                 "migration_errors": 2, "migrate_ms": pytest.approx(1.0), "migrated": 1}
+    h2 = analyze.migration_metrics(df, ev, {"transport": "h2", "dials": 2})
+    assert h2["migrated"] == 0
+    failed = analyze.migration_metrics(df, pd.Series({"migrate_start": t_m, "migrate_failed": t_m + 2_000_000}),
+                                       {"transport": "h3", "dials": 2})
+    assert failed["migrated"] == 0 and failed["migrate_ms"] == pytest.approx(2.0)
+
+
+def test_main_s4_columns(tmp_path):
+    for t in ["h2", "h3"]:
+        write_rep(tmp_path / "s4-migration" / t / "rep-1", t, dials=2 if t == "h2" else 1, hops=HOPS,
+                  migration={"at_s": 2, "ok": t == "h3"}, peers=PEERS)
+        write_rep(tmp_path / "s1-baseline" / t / "rep-1", t)
+    assert analyze.main([str(tmp_path)]) == 0
+    reps = pd.read_csv(tmp_path / "analysis" / "reps.csv").set_index(["scenario", "transport"])
+    cols = ["interrupt_ms", "gap_base_ms", "migration_errors", "migrate_ms", "migrated"]
+    assert reps.loc[("s4-migration", "h3"), cols].notna().all()
+    assert reps.loc[("s4-migration", "h3"), "migrated"] == 1 and reps.loc[("s4-migration", "h2"), "migrated"] == 0
+    assert reps.loc[("s1-baseline", "h3"), cols].isna().all()
+    c = pd.read_csv(tmp_path / "analysis" / "comparison.csv")
+    assert {"interrupt_ms", "gap_base_ms", "migration_errors", "migrate_ms"} <= set(c.metric[c.scenario == "s4-migration"])
+
+
+def test_s4_degraded_excludes_migration_window(tmp_path):
+    d = tmp_path / "s4-migration" / "h3" / "rep-1"
+    write_rep(d, "h3", n=1000, hops=HOPS, migration={"at_s": 3, "ok": True}, peers=PEERS)
+    t0 = 1_700_000_000 * S
+    lines = [HEADER]
+    for i in range(1000):
+        start = t0 + i * 10_000_000
+        if t0 + 3 * S + 100_000_000 <= start < t0 + 5 * S + 100_000_000:
+            continue  # 2 s hole right after t_m
+        lines.append(f"{i},0,{start},1000,ok,100,100,measure\n")
+    (d / "requests.csv").write_text("".join(lines))
+    assert analyze.main([str(tmp_path)]) == 0
+    assert pd.read_csv(tmp_path / "analysis" / "reps.csv").degraded_s[0] == 0
+
+
+def test_s4_migrate_start_without_end_event_skips_only_that_rep(tmp_path, capsys):
+    for r in [1, 2]:
+        write_rep(tmp_path / "s4-migration" / "h2" / f"rep-{r}", "h2", dials=2, hops=HOPS,
+                  migration={"at_s": 2, "ok": True}, peers=PEERS)
+    ev = tmp_path / "s4-migration" / "h2" / "rep-2" / "events.csv"
+    ev.write_text("\n".join(ev.read_text().splitlines()[:3]) + "\n")  # header, ip_added, migrate_start
+    assert analyze.main([str(tmp_path)]) == 0
+    assert pd.read_csv(tmp_path / "analysis" / "summary.csv").n[0] == 1
+    assert "migrate_start without migrated/migrate_failed in events.csv, skipped" in capsys.readouterr().err

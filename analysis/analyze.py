@@ -23,7 +23,7 @@ QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
 COMPARE = [
     "p50", "p99", "p999", "p50_all", "p99_all", "p999_all", "error_rate", "ok_rps", "served_frac", "recovery_s", "cpu_per_krps", "handshake_ms",
-    "orphans", "orphan_share",
+    "orphans", "orphan_share", "interrupt_ms", "gap_base_ms", "migration_errors", "migrate_ms",
 ]
 RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
 RPC_SERVICES = ["gateway", "core", "ledger"]  # the gRPC services whose CPU makes rpc_cpu
@@ -436,6 +436,60 @@ def orphans(d) -> dict:
     return {"orphans": n, "orphan_share": n / failed if failed else np.nan}
 
 
+def read_events(d) -> pd.Series | None:
+    """ts_ns of events.csv indexed by event name; None when the rep has no events.csv."""
+    f = d / "events.csv"
+    return pd.read_csv(f).set_index("event")["ts_ns"] if f.exists() else None
+
+
+def expected_dials(meta, events) -> int:
+    """Client dials of a valid rep (s4 spec §7.1): h2 redials on every migration, h3 only
+    when the migration failed."""
+    n = meta.get("migrations", 0)
+    if n == 0 or (meta.get("transport") == "h3" and events is not None and "migrated" in events.index):
+        return 1
+    return 1 + n
+
+
+def peer_problems(d, meta) -> list[str]:
+    """Why a migration rep is invalid: the gateway has not seen migrate_to plus another client IP."""
+    if meta.get("migrations", 0) <= 0:
+        return []
+    try:
+        peers = json.loads((d / "svc-gateway.json").read_text())["peers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        peers = {}
+    if meta.get("migrate_to") not in peers or len(peers) < 2:
+        return ["migration not seen by the gateway"]
+    return []
+
+
+def max_gap_ms(df, lo_ns, hi_ns) -> float:
+    """Largest gap in ms between consecutive ok completions inside [lo, hi]; lo and hi count
+    as completions, so a window without ok gives hi - lo."""
+    done = df.start_ns + df.latency_us * 1000
+    t = np.sort(done[(df.status == "ok") & (done > lo_ns) & (done < hi_ns)].to_numpy(dtype="int64"))
+    return float(np.diff(np.concatenate([[lo_ns], t, [hi_ns]])).max() / 1e6)
+
+
+def migration_metrics(df, events, meta) -> dict:
+    """s4 interruption metrics (spec §7.2) around t_m = migrate_start: interrupt_ms, the largest
+    ok gap in [t_m - 1 s, t_m + 5 s]; gap_base_ms, the same in [t_m - 11 s, t_m - 5 s];
+    migration_errors, failed RPCs completing in the first window; migrate_ms, migrate_start to
+    migrated/migrate_failed; migrated, 1 when h3 kept its single connection."""
+    t_m = int(events["migrate_start"])
+    lo, hi = t_m - NS, t_m + 5 * NS
+    done = df.start_ns + df.latency_us * 1000
+    end = events["migrated" if "migrated" in events.index else "migrate_failed"]
+    return {
+        "interrupt_ms": max_gap_ms(df, lo, hi),
+        "gap_base_ms": max_gap_ms(df, t_m - 11 * NS, t_m - 5 * NS),
+        "migration_errors": int(((df.status != "ok") & done.between(lo, hi)).sum()),
+        "migrate_ms": (end - t_m) / 1e6,
+        "migrated": int("migrated" in events.index and meta.get("dials") == 1),
+    }
+
+
 def _rep_row(d, name):
     """Metrics of one repetition dir, or None when it is not valid."""
     meta_path = d / "meta.json"
@@ -446,10 +500,22 @@ def _rep_row(d, name):
     if meta.get("interrupted"):
         _warn(f"{name}: interrupted, skipped")
         return None
-    if meta.get("dials") != 1:  # spec §9: more than one connection invalidates the rep
-        _warn(f"{name}: dials={meta.get('dials')}, skipped")
+    try:
+        events = read_events(d)
+    except (ValueError, KeyError, pd.errors.EmptyDataError):
+        _warn(f"{name}: events.csv unreadable, skipped")
         return None
-    for problem in hop_problems(d):  # the same rule on every internal hop (payment spec §10)
+    if meta.get("migrations", 0) > 0 and (events is None or "migrate_start" not in events.index):
+        _warn(f"{name}: migrations={meta['migrations']} but no migrate_start in events.csv, skipped")
+        return None
+    if events is not None and "migrate_start" in events.index and not {"migrated", "migrate_failed"} & set(events.index):
+        _warn(f"{name}: migrate_start without migrated/migrate_failed in events.csv, skipped")
+        return None
+    want = expected_dials(meta, events)
+    if meta.get("dials") != want:  # spec §9 / s4 §7.1
+        _warn(f"{name}: dials={meta.get('dials')}, expected {want}, skipped")
+        return None
+    for problem in hop_problems(d) + peer_problems(d, meta):  # the same rule on every internal hop (payment spec §10)
         _warn(f"{name}: {problem}, skipped")
         return None
     df = load_requests(d / "requests.csv")
@@ -496,8 +562,11 @@ def _scan(run):
         row, df, meta = got
         rps = meta.get("load", {}).get("rps", 0)
         s, exclude, entry = throughput_series(df), None, None
-        if (d / "events.csv").exists():
-            ev = pd.read_csv(d / "events.csv").set_index("event").ts_ns
+        ev = read_events(d)
+        if ev is not None and "migrate_start" in ev.index:
+            row.update(migration_metrics(df, ev, meta))
+            exclude = (ev.migrate_start - NS, ev.migrate_start + 5 * NS)
+        elif ev is not None and "outage_start" in ev.index:
             s = throughput_series(df, origin=ev.outage_end)
             rec = recovery_time(s, ev.outage_start, ev.outage_end)
             if rec is None:
