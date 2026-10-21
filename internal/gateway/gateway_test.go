@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -62,6 +64,35 @@ func TestCoreErrorPropagates(t *testing.T) {
 	_, err := create(New(&core{code: connect.CodeDeadlineExceeded}, slog.New(slog.DiscardHandler)), "p1")
 	if connect.CodeOf(err) != connect.CodeDeadlineExceeded {
 		t.Fatalf("err = %v; want deadline_exceeded", err)
+	}
+}
+
+func TestPeers(t *testing.T) {
+	h := New(&core{}, slog.New(slog.DiscardHandler))
+	path, handler := paymentv1connect.NewPaymentServiceHandler(h)
+	mux := http.NewServeMux()
+	mux.Handle(path, handler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	cli := paymentv1connect.NewPaymentServiceClient(srv.Client(), srv.URL)
+	for _, id := range []string{"p1", "p2"} {
+		if _, err := cli.CreatePayment(context.Background(), connect.NewRequest(&paymentv1.CreatePaymentRequest{
+			PaymentId: id, AccountId: 4821, AmountCents: 1000})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := h.Peers(); len(got) != 1 || got["127.0.0.1"] != 2 {
+		t.Fatalf("peers = %v; want {127.0.0.1: 2}", got)
+	}
+}
+
+func TestPeersSkipsUnknownAddr(t *testing.T) {
+	h := New(&core{}, slog.New(slog.DiscardHandler))
+	if _, err := create(h, "p1"); err != nil { // no Peer on a unit-test request
+		t.Fatal(err)
+	}
+	if got := h.Peers(); len(got) != 0 {
+		t.Fatalf("peers = %v; want empty", got)
 	}
 }
 

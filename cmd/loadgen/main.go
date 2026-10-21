@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	randv2 "math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +32,12 @@ var version = "dev" // set with -ldflags "-X main.version=..."
 
 // amountCents is the fixed amount of every payment (spec §6.4).
 const amountCents = 1000
+
+// localPrefix and runIP are the system lookups of the migration; tests replace them.
+var (
+	localPrefix = loadgen.LocalPrefix
+	runIP       = loadgen.ExecIP
+)
 
 // logLevel is the level of main's logger; run sets it from --log-level.
 var logLevel = new(slog.LevelVar)
@@ -62,6 +69,8 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	var target, out string
 	var accounts int
 	var strict bool
+	var migrateAt time.Duration
+	var migrateTo string
 
 	fs := flag.NewFlagSet("loadgen", flag.ContinueOnError)
 	tcfg.RegisterFlags(fs, transport.RoleClient)
@@ -74,6 +83,8 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	fs.IntVar(&accounts, "accounts", 10000, "accounts 1..N to draw from (the ledger's seed)")
 	fs.DurationVar(&lcfg.Deadline, "deadline", 2*time.Second, "per-RPC timeout")
 	fs.BoolVar(&strict, "strict", false, "exit 1 on any non-ok RPC or more than one connection")
+	fs.DurationVar(&migrateAt, "migrate-at", 0, "0 = off; else move the client to --migrate-to this long after the load starts")
+	fs.StringVar(&migrateTo, "migrate-to", "", "new client IPv4 for --migrate-at")
 	fs.StringVar(&out, "out", "/results/requests.csv", "requests.csv path")
 	level := slog.LevelInfo
 	var levelErr error
@@ -99,6 +110,25 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 	if accounts < 1 {
 		errs = append(errs, errors.New("accounts must be > 0"))
+	}
+	var to netip.Addr
+	switch {
+	case migrateAt < 0:
+		errs = append(errs, errors.New("migrate-at must be >= 0"))
+	case migrateAt == 0 && migrateTo != "":
+		errs = append(errs, errors.New("migrate-to needs migrate-at"))
+	case migrateAt > 0:
+		var perr error
+		if to, perr = netip.ParseAddr(migrateTo); perr != nil || !to.Is4() {
+			errs = append(errs, fmt.Errorf("migrate-to %q: want an IPv4 address", migrateTo))
+		}
+		if migrateAt > lcfg.Warmup+lcfg.Duration {
+			errs = append(errs, errors.New("migrate-at is after warmup + duration"))
+		}
+		if lcfg.Requests > 0 {
+			errs = append(errs, errors.New("migrate-at is incompatible with requests"))
+		}
+		tcfg.Migratable = true
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -161,6 +191,30 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 	log.Info("probe ok", "transport", tcfg.Transport, "target", target, "handshake_us", handshake.Microseconds())
 
+	// The migration goroutine finishes before events.csv and meta.json are written.
+	ev := &loadgen.Events{}
+	type migResult struct {
+		migrated bool
+		err      error
+	}
+	migDone := make(chan migResult, 1)
+	if migrateAt > 0 {
+		go func() {
+			select {
+			case <-time.After(migrateAt):
+			case <-ctx.Done():
+				migDone <- migResult{}
+				return
+			}
+			m := loadgen.Migration{To: to, Timeout: lcfg.Deadline, Local: localPrefix, IP: runIP,
+				Migrate: cli.Migrate, Log: log}
+			migrated, err := m.Run(ctx, ev)
+			migDone <- migResult{migrated, err}
+		}()
+	} else {
+		migDone <- migResult{}
+	}
+
 	rec := loadgen.NewRecorder(f, 1<<16)
 	res := loadgen.Run(ctx, lcfg, func(ctx context.Context) (int, error) {
 		r, err := pay(ctx)
@@ -176,13 +230,25 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 		return fmt.Errorf("write %s: %w", out, err)
 	}
 
+	mig := <-migDone
+	migrations := 0
+	if ev.Has(loadgen.EventMigrateStart) {
+		migrations = 1
+	}
+	if err := ev.WriteCSV(filepath.Join(filepath.Dir(out), "events.csv")); err != nil {
+		return fmt.Errorf("events: %w", err)
+	}
+
 	meta := loadgen.Meta{
 		Version: version, Transport: tcfg.Transport.String(), Target: target,
 		TransportCfg: tcfg, Load: lcfg,
 		Start: res.Start, End: res.End, Interrupted: ctx.Err() != nil, HandshakeUs: handshake.Microseconds(),
 		Dials: cli.Dials(), Total: res.Total, OK: res.OK, Errors: res.Errors,
 		LateStarts: res.LateStarts, Unsent: res.Unsent, RecorderStalls: rec.Stalls(),
-		Sysctl: loadgen.ReadSysctls(),
+		Sysctl: loadgen.ReadSysctls(), Migrations: migrations,
+	}
+	if migrateAt > 0 {
+		meta.MigrateTo = to.String()
 	}
 	if err := loadgen.WriteMeta(filepath.Join(filepath.Dir(out), "meta.json"), meta); err != nil {
 		return fmt.Errorf("meta: %w", err)
@@ -190,11 +256,15 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	log.Info("summary", "total", res.Total, "ok", res.OK, "errors", res.Errors,
 		"dials", meta.Dials, "late_starts", res.LateStarts, "unsent", res.Unsent)
 
+	if mig.err != nil {
+		return fmt.Errorf("migration: %w", mig.err)
+	}
 	if meta.Interrupted {
 		return errors.New("interrupted: results are partial")
 	}
-	if strict && (res.OK != res.Total || meta.Dials != 1) {
-		return fmt.Errorf("strict: ok=%d total=%d dials=%d", res.OK, res.Total, meta.Dials)
+	wantDials := loadgen.ExpectedDials(tcfg.Transport, migrations, mig.migrated)
+	if strict && (res.OK != res.Total || meta.Dials != wantDials) {
+		return fmt.Errorf("strict: ok=%d total=%d dials=%d want %d", res.OK, res.Total, meta.Dials, wantDials)
 	}
 	return nil
 }

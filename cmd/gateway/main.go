@@ -54,7 +54,8 @@ func run(ctx context.Context, args []string) error {
 	}
 	defer cli.Close()
 	core := paymentv1connect.NewCoreServiceClient(cli, "https://"+coreAddr, opts...)
-	path, h := paymentv1connect.NewPaymentServiceHandler(gateway.New(core, log), service.HandlerOptions(log)...)
+	gw := gateway.New(core, log)
+	path, h := paymentv1connect.NewPaymentServiceHandler(gw, service.HandlerOptions(log)...)
 	srv, err := service.Listen("gateway", version, c.Transport, log, path, h)
 	if err != nil {
 		return err
@@ -63,5 +64,5 @@ func run(ctx context.Context, args []string) error {
 	log.Info("gateway stopped", "error", err)
 	return errors.Join(err, service.WriteReport(c.RepDir, service.Report{
 		Service: "gateway", Version: version, Transport: c.Transport.Transport.String(),
-		Dials: map[string]int64{coreAddr: cli.Dials()}}))
+		Dials: map[string]int64{coreAddr: cli.Dials()}, Peers: gw.Peers()}))
 }

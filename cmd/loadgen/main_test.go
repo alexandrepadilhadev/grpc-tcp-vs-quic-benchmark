@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -286,5 +289,123 @@ func TestInterrupted(t *testing.T) {
 	}
 	if err := json.Unmarshal(b, &m); err != nil || !m.Interrupted {
 		t.Fatalf("meta interrupted=%v err=%v", m.Interrupted, err)
+	}
+}
+
+func TestMigrateFlags(t *testing.T) {
+	cases := map[string][]string{
+		"at without to":         {"--migrate-at=1s"},
+		"to without at":         {"--migrate-to=10.10.0.250"},
+		"ipv6":                  {"--migrate-at=1s", "--migrate-to=::1"},
+		"not an address":        {"--migrate-at=1s", "--migrate-to=nope"},
+		"at after the load":     {"--migrate-at=80s", "--migrate-to=10.10.0.250", "--warmup=10s", "--duration=60s"},
+		"incompatible requests": {"--migrate-at=1s", "--migrate-to=10.10.0.250", "--requests=10"},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			args := append([]string{"--target=127.0.0.1:1", "--tls-ca=ca.crt",
+				"--out=" + filepath.Join(t.TempDir(), "requests.csv")}, extra...)
+			if err := run(context.Background(), args, discard); err == nil || !strings.Contains(err.Error(), "migrate") {
+				t.Fatalf("err = %v; want a migrate flag error", err)
+			}
+		})
+	}
+}
+
+// fakeIP replaces the ip command and the interface lookup for the test.
+func fakeIP(t *testing.T) *[]string {
+	t.Helper()
+	var calls []string
+	var mu sync.Mutex
+	oldL, oldI := localPrefix, runIP
+	localPrefix = func(netip.Addr) (string, netip.Prefix, error) {
+		return "lo", netip.MustParsePrefix("127.0.0.1/8"), nil
+	}
+	runIP = func(_ context.Context, args ...string) error {
+		mu.Lock()
+		calls = append(calls, strings.Join(args, " "))
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { localPrefix, runIP = oldL, oldI })
+	return &calls
+}
+
+func TestMigrateRun(t *testing.T) {
+	transporttest.NeedLoopback2(t)
+	for _, tr := range []transport.Transport{transport.H2, transport.H3} {
+		t.Run(tr.String(), func(t *testing.T) {
+			calls := fakeIP(t)
+			store := ledger.NewMemStore(10000, 1e15)
+			c := startChain(t, tr, store, "")
+			out := filepath.Join(t.TempDir(), "run", "requests.csv")
+			args := []string{
+				"--transport=" + tr.String(), "--target=" + c.gatewayAddr, "--tls-ca=" + c.ca,
+				"--rps=200", "--duration=2s", "--warmup=0", "--concurrency=50",
+				"--migrate-at=1s", "--migrate-to=127.0.0.2", "--out=" + out,
+			}
+			if tr == transport.H3 { // h2 closes the old connection: in-flight RPCs may fail
+				args = append(args, "--strict")
+			}
+			if err := run(context.Background(), args, discard); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"addr add 127.0.0.2/8 dev lo", "addr del 127.0.0.1/8 dev lo"}
+			if !slices.Equal(*calls, want) {
+				t.Fatalf("ip calls = %q; want %q", *calls, want)
+			}
+			b, err := os.ReadFile(filepath.Join(filepath.Dir(out), "events.csv"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n")[1:] {
+				names = append(names, strings.Split(l, ",")[0])
+			}
+			if !slices.Equal(names, []string{"ip_added", "migrate_start", "migrated", "ip_removed"}) {
+				t.Fatalf("events = %q", names)
+			}
+			var m loadgen.Meta
+			b, err = os.ReadFile(filepath.Join(filepath.Dir(out), "meta.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatal(err)
+			}
+			wantDials := int64(1)
+			if tr == transport.H2 {
+				wantDials = 2
+			}
+			if m.Migrations != 1 || m.MigrateTo != "127.0.0.2" || m.Dials != wantDials || !m.TransportCfg.Migratable || m.OK == 0 {
+				t.Fatalf("meta = %+v", m)
+			}
+		})
+	}
+}
+
+func TestMigrateInterruptedBeforeAt(t *testing.T) {
+	calls := fakeIP(t)
+	c := startChain(t, transport.H2, ledger.NewMemStore(10000, 1e15), "")
+	out := filepath.Join(t.TempDir(), "requests.csv")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := run(ctx, []string{
+		"--target=" + c.gatewayAddr, "--tls-ca=" + c.ca, "--duration=10s", "--warmup=0",
+		"--migrate-at=1s", "--migrate-to=127.0.0.2", "--out=" + out,
+	}, discard)
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("err = %v; want interrupted", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("ip calls = %q; want none", *calls)
+	}
+	var m loadgen.Meta
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(out), "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &m); err != nil || m.Migrations != 0 || !m.Interrupted {
+		t.Fatalf("meta migrations=%d interrupted=%v err=%v", m.Migrations, m.Interrupted, err)
 	}
 }

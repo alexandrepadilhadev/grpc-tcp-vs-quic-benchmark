@@ -207,6 +207,31 @@ func TestWriteReport(t *testing.T) {
 	}
 }
 
+func TestWriteReportPeers(t *testing.T) {
+	read := func(r Report) map[string]any {
+		dir := t.TempDir()
+		if err := WriteReport(dir, r); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "svc-gateway.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	m := read(Report{Service: "gateway", Peers: map[string]int64{"10.10.0.2": 3}})
+	if p, _ := m["peers"].(map[string]any); p["10.10.0.2"] != float64(3) {
+		t.Fatalf("peers = %v; want {10.10.0.2: 3}", m["peers"])
+	}
+	if _, ok := read(Report{Service: "gateway"})["peers"]; ok {
+		t.Fatal(`"peers" present without Peers`)
+	}
+}
+
 // TestWriteReportEmptyMaps: every svc-*.json has the same shape, so the
 // analysis can read dials/counters without special cases.
 func TestWriteReportEmptyMaps(t *testing.T) {

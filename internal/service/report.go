@@ -13,6 +13,7 @@ type Report struct {
 	Transport string           `json:"transport"`
 	Dials     map[string]int64 `json:"dials"`
 	Counters  map[string]int64 `json:"counters"`
+	Peers     map[string]int64 `json:"peers,omitempty"` // gateway only: RPCs per client IP
 }
 
 // WriteReport writes dir/svc-<Service>.json; dir == "" is a no-op.
