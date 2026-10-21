@@ -472,19 +472,28 @@ def max_gap_ms(df, lo_ns, hi_ns) -> float:
     return float(np.diff(np.concatenate([[lo_ns], t, [hi_ns]])).max() / 1e6)
 
 
-def migration_metrics(df, events, meta) -> dict:
+def migration_metrics(df, events, meta, name="") -> dict:
     """s4 interruption metrics (spec §7.2) around t_m = migrate_start: interrupt_ms, the largest
     ok gap in [t_m - 1 s, t_m + 5 s]; gap_base_ms, the same in [t_m - 11 s, t_m - 5 s];
     migration_errors, failed RPCs completing in the first window; migrate_ms, migrate_start to
-    migrated/migrate_failed; migrated, 1 when h3 kept its single connection."""
+    migrated/migrate_failed; migrated, 1 when h3 kept its single connection. A windowed metric is NaN (with a warning)
+    when its window is not inside the measured span [first, last measure start]."""
     t_m = int(events["migrate_start"])
     lo, hi = t_m - NS, t_m + 5 * NS
+    span = df.start_ns.min(), df.start_ns.max()
+
+    def inside(metric, a, b):
+        if span[0] <= a and b <= span[1]:
+            return True
+        _warn(f"{name}: {metric} window outside the measure phase, left empty")
+        return False
+
     done = df.start_ns + df.latency_us * 1000
     end = events["migrated" if "migrated" in events.index else "migrate_failed"]
     return {
-        "interrupt_ms": max_gap_ms(df, lo, hi),
-        "gap_base_ms": max_gap_ms(df, t_m - 11 * NS, t_m - 5 * NS),
-        "migration_errors": int(((df.status != "ok") & done.between(lo, hi)).sum()),
+        "interrupt_ms": max_gap_ms(df, lo, hi) if inside("interrupt_ms", lo, hi) else np.nan,
+        "gap_base_ms": max_gap_ms(df, t_m - 11 * NS, t_m - 5 * NS) if inside("gap_base_ms", t_m - 11 * NS, t_m - 5 * NS) else np.nan,
+        "migration_errors": int(((df.status != "ok") & done.between(lo, hi)).sum()) if inside("migration_errors", lo, hi) else np.nan,
         "migrate_ms": (end - t_m) / 1e6,
         "migrated": int("migrated" in events.index and meta.get("dials") == 1),
     }
@@ -564,7 +573,7 @@ def _scan(run):
         s, exclude, entry = throughput_series(df), None, None
         ev = read_events(d)
         if ev is not None and "migrate_start" in ev.index:
-            row.update(migration_metrics(df, ev, meta))
+            row.update(migration_metrics(df, ev, meta, name))
             exclude = (ev.migrate_start - NS, ev.migrate_start + 5 * NS)
         elif ev is not None and "outage_start" in ev.index:
             s = throughput_series(df, origin=ev.outage_end)

@@ -670,8 +670,8 @@ def test_migration_metrics():
 
 def test_main_s4_columns(tmp_path):
     for t in ["h2", "h3"]:
-        write_rep(tmp_path / "s4-migration" / t / "rep-1", t, dials=2 if t == "h2" else 1, hops=HOPS,
-                  migration={"at_s": 2, "ok": t == "h3"}, peers=PEERS)
+        write_rep(tmp_path / "s4-migration" / t / "rep-1", t, n=2500, dials=2 if t == "h2" else 1, hops=HOPS,
+                  migration={"at_s": 13, "ok": t == "h3"}, peers=PEERS)  # windows inside the 25 s of load
         write_rep(tmp_path / "s1-baseline" / t / "rep-1", t)
     assert analyze.main([str(tmp_path)]) == 0
     reps = pd.read_csv(tmp_path / "analysis" / "reps.csv").set_index(["scenario", "transport"])
@@ -707,3 +707,23 @@ def test_s4_migrate_start_without_end_event_skips_only_that_rep(tmp_path, capsys
     assert analyze.main([str(tmp_path)]) == 0
     assert pd.read_csv(tmp_path / "analysis" / "summary.csv").n[0] == 1
     assert "migrate_start without migrated/migrate_failed in events.csv, skipped" in capsys.readouterr().err
+
+
+def test_migration_metrics_window_before_measure_is_nan(capsys):
+    t_m = 1_700_000_030 * S
+    df = migration_df(t_m)
+    df = df[df.start_ns >= t_m - 8 * S]  # measure starts 8 s before t_m: base window [-11, -5] sticks out
+    ev = pd.Series({"migrate_start": t_m, "migrated": t_m + 1_000_000})
+    m = analyze.migration_metrics(df, ev, {"transport": "h3", "dials": 1}, "s4/h3/rep-1")
+    assert math.isnan(m["gap_base_ms"]) and m["interrupt_ms"] == pytest.approx(50.0) and m["migration_errors"] == 2
+    assert capsys.readouterr().err.count("s4/h3/rep-1: gap_base_ms window outside the measure phase, left empty") == 1
+
+
+def test_migration_metrics_window_after_measure_is_nan(capsys):
+    t_m = 1_700_000_030 * S
+    df = migration_df(t_m)
+    df = df[df.start_ns <= t_m + 3 * S]  # load ends 3 s after t_m
+    ev = pd.Series({"migrate_start": t_m, "migrated": t_m + 1_000_000})
+    m = analyze.migration_metrics(df, ev, {"transport": "h3", "dials": 1}, "r")
+    assert math.isnan(m["interrupt_ms"]) and math.isnan(m["migration_errors"]) and m["gap_base_ms"] == pytest.approx(10.0)
+    assert m["migrated"] == 1 and m["migrate_ms"] == pytest.approx(1.0)
