@@ -290,7 +290,8 @@ def write_rep(d, transport, outage=None, n=500, dials=1, rps=100, hops=None, nam
     (d / "meta.json").write_text(
         f'{{"transport": "{transport}", "dials": {dials}, "interrupted": false,'
         f' "handshake_us": 4000, "ok": {n // 2}, "unsent": 0,'
-        + (' "migrations": 1, "migrate_to": "10.10.0.250",' if migration else "") +
+        + (f' "migrations": 1, "migrate_to": "10.10.0.250", "migrate_at_ns": {migration["at_s"] * S},'
+           if migration else "") +
         f' "load": {{"rps": {rps}, "duration_ns": {n // 100 * S}, "deadline_ns": {2 * S}}}}}'
     )
     stats = ["ts_ns,name,cpu_perc,mem_usage\n"]  # the idle sample before the measured window is ignored
@@ -511,6 +512,26 @@ def test_s4_h3_migrated_two_dials_is_skipped(tmp_path, capsys):
 def test_s4_h3_failed_migration_two_dials_is_valid(tmp_path):
     s4_run(tmp_path, "h3", ok=False, dials=2)
     assert s4_valid(tmp_path)
+
+
+def test_s4_h3_failed_migration_one_dial_is_valid_not_migrated(tmp_path):
+    s4_run(tmp_path, "h3", ok=False, dials=1)  # passive server migration kept the connection
+    assert s4_valid(tmp_path)
+    assert pd.read_csv(tmp_path / "analysis" / "reps.csv").migrated[0] == 0
+
+
+def test_s4_h3_failed_migration_three_dials_is_skipped(tmp_path, capsys):
+    s4_run(tmp_path, "h3", ok=False, dials=3)
+    assert not s4_valid(tmp_path)
+    assert "dials=3, expected 1 or 2, skipped" in capsys.readouterr().err
+
+
+def test_main_warns_on_different_migration(tmp_path, capsys):
+    for run, at_s in [("run-a", 2), ("run-b", 3)]:
+        write_rep(tmp_path / run / "s4-migration" / "h2" / "rep-1", "h2", dials=2, hops=HOPS,
+                  migration={"at_s": at_s, "ok": True}, peers=PEERS)
+    assert analyze.main([str(tmp_path / "run-a"), str(tmp_path / "run-b"), "--out", str(tmp_path / "m")]) == 0
+    assert "s4-migration: load differs between runs" in capsys.readouterr().err
 
 
 def test_s4_without_new_ip_in_peers_is_skipped(tmp_path, capsys):

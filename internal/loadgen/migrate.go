@@ -27,6 +27,9 @@ const (
 	EventIPRemoved     = "ip_removed"
 )
 
+// delTimeout bounds the `ip addr del` that runs after ctx is canceled.
+const delTimeout = 5 * time.Second
+
 type eventRow struct {
 	name string
 	ts   int64
@@ -111,8 +114,10 @@ func (m Migration) Run(ctx context.Context, ev *Events) (migrated bool, err erro
 	}
 	log.Info("migration", "to", m.To, "iface", iface, "old", old, "migrated", migrated, "error", merr)
 
-	// The old IP goes away even when Migrate failed or ctx was canceled.
-	if err := m.IP(context.WithoutCancel(ctx), "addr", "del", old.String(), "dev", iface); err != nil {
+	// The old IP goes away even when Migrate failed or ctx was canceled; bounded so a hung ip cannot stall the run.
+	dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), delTimeout)
+	defer dcancel()
+	if err := m.IP(dctx, "addr", "del", old.String(), "dev", iface); err != nil {
 		return migrated, fmt.Errorf("ip addr del: %w", err)
 	}
 	ev.Add(EventIPRemoved)
@@ -172,10 +177,18 @@ func ExecIP(ctx context.Context, args ...string) error {
 	return nil
 }
 
-// ExpectedDials is the meta.json dials value for a run (spec 7.1).
-func ExpectedDials(t transport.Transport, migrations int, migrated bool) int64 {
-	if t == transport.H3 && migrated {
-		return 1
+// DialsValid reports whether the meta.json dials value is valid for a run (spec 7.1).
+// h3 after a failed Probe may keep its connection (passive server migration): 1 or 1 + migrations.
+func DialsValid(t transport.Transport, migrations int, migrated bool, dials int64) bool {
+	redial := 1 + int64(migrations)
+	switch {
+	case migrations == 0:
+		return dials == 1
+	case t != transport.H3:
+		return dials == redial
+	case migrated:
+		return dials == 1
+	default:
+		return dials == 1 || dials == redial
 	}
-	return 1 + int64(migrations)
 }

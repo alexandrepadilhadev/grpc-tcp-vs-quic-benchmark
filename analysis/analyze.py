@@ -442,13 +442,17 @@ def read_events(d) -> pd.Series | None:
     return pd.read_csv(f).set_index("event")["ts_ns"] if f.exists() else None
 
 
-def expected_dials(meta, events) -> int:
-    """Client dials of a valid rep (s4 spec §7.1): h2 redials on every migration, h3 only
-    when the migration failed."""
+def valid_dials(meta, events) -> set[int]:
+    """Client dials accepted for a rep (s4 spec §7.1): h2 redials on every migration; h3 keeps
+    1 when migrated, and after a failed Probe either redials or survives by passive server migration."""
     n = meta.get("migrations", 0)
-    if n == 0 or (meta.get("transport") == "h3" and events is not None and "migrated" in events.index):
-        return 1
-    return 1 + n
+    if n == 0:
+        return {1}
+    if meta.get("transport") != "h3":
+        return {1 + n}
+    if events is not None and "migrated" in events.index:
+        return {1}
+    return {1, 1 + n}
 
 
 def peer_problems(d, meta) -> list[str]:
@@ -520,9 +524,9 @@ def _rep_row(d, name):
     if events is not None and "migrate_start" in events.index and not {"migrated", "migrate_failed"} & set(events.index):
         _warn(f"{name}: migrate_start without migrated/migrate_failed in events.csv, skipped")
         return None
-    want = expected_dials(meta, events)
-    if meta.get("dials") != want:  # spec §9 / s4 §7.1
-        _warn(f"{name}: dials={meta.get('dials')}, expected {want}, skipped")
+    want = valid_dials(meta, events)
+    if meta.get("dials") not in want:  # spec §9 / s4 §7.1
+        _warn(f"{name}: dials={meta.get('dials')}, expected {' or '.join(map(str, sorted(want)))}, skipped")
         return None
     for problem in hop_problems(d) + peer_problems(d, meta):  # the same rule on every internal hop (payment spec §10)
         _warn(f"{name}: {problem}, skipped")
@@ -615,7 +619,8 @@ def _check_runs(found):
     seen = {}
     for row, _, _, meta in found:
         s = seen.setdefault(row["scenario"], {"load": set(), "commit": set()})
-        s["load"].add(json.dumps(meta.get("load"), sort_keys=True))
+        load = {"load": meta.get("load"), "migrate_at_ns": meta.get("migrate_at_ns"), "migrate_to": meta.get("migrate_to")}
+        s["load"].add(json.dumps(load, sort_keys=True))
         s["commit"].add(meta.get("version"))
     for scenario, s in seen.items():
         for what, values in s.items():

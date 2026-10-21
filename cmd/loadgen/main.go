@@ -249,6 +249,7 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 	if migrateAt > 0 {
 		meta.MigrateTo = to.String()
+		meta.MigrateAtNs = migrateAt.Nanoseconds()
 	}
 	if err := loadgen.WriteMeta(filepath.Join(filepath.Dir(out), "meta.json"), meta); err != nil {
 		return fmt.Errorf("meta: %w", err)
@@ -262,9 +263,9 @@ func run(ctx context.Context, args []string, log *slog.Logger) error {
 	if meta.Interrupted {
 		return errors.New("interrupted: results are partial")
 	}
-	wantDials := loadgen.ExpectedDials(tcfg.Transport, migrations, mig.migrated)
-	if strict && (res.OK != res.Total || meta.Dials != wantDials) {
-		return fmt.Errorf("strict: ok=%d total=%d dials=%d want %d", res.OK, res.Total, meta.Dials, wantDials)
+	if strict && (res.OK != res.Total || !loadgen.DialsValid(tcfg.Transport, migrations, mig.migrated, meta.Dials)) {
+		return fmt.Errorf("strict: ok=%d total=%d dials=%d (migrations=%d migrated=%v)",
+			res.OK, res.Total, meta.Dials, migrations, mig.migrated)
 	}
 	return nil
 }

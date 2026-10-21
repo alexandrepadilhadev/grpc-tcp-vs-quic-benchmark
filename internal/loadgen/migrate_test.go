@@ -116,20 +116,26 @@ func TestMigrationCanceledStillRemovesIP(t *testing.T) {
 		return c.Err()
 	}
 	var delErr error
+	var delDeadline time.Time
 	f.m.IP = func(c context.Context, args ...string) error {
 		f.ipCalls = append(f.ipCalls, args)
 		if args[1] == "del" {
 			delErr = c.Err()
+			delDeadline, _ = c.Deadline()
 		}
 		return nil
 	}
 	ev := &Events{}
 	migrated, err := f.m.Run(ctx, ev)
+	end := time.Now()
 	if err != nil || migrated {
 		t.Fatalf("migrated=%v err=%v", migrated, err)
 	}
 	if len(f.ipCalls) != 2 || f.ipCalls[1][1] != "del" || delErr != nil {
 		t.Fatalf("ip calls = %v, del ctx err = %v", f.ipCalls, delErr)
+	}
+	if delDeadline.IsZero() || delDeadline.After(end.Add(5*time.Second)) {
+		t.Fatalf("del ctx deadline = %v, want within 5 s", delDeadline)
 	}
 	names := eventNames(ev)
 	if names[len(names)-1] != EventIPRemoved {
@@ -212,22 +218,30 @@ func TestEventsCSV(t *testing.T) {
 	}
 }
 
-func TestExpectedDials(t *testing.T) {
+func TestDialsValid(t *testing.T) {
 	cases := []struct {
 		t          transport.Transport
 		migrations int
 		migrated   bool
-		want       int64
+		dials      int64
+		want       bool
 	}{
-		{transport.H2, 0, false, 1},
-		{transport.H2, 1, false, 2},
-		{transport.H3, 1, true, 1},
-		{transport.H3, 1, false, 2},
-		{transport.H3, 0, false, 1},
+		{transport.H2, 0, false, 1, true},
+		{transport.H2, 0, false, 2, false},
+		{transport.H2, 1, false, 2, true},
+		{transport.H2, 1, true, 2, true},
+		{transport.H2, 1, false, 1, false},
+		{transport.H3, 0, false, 1, true},
+		{transport.H3, 0, false, 2, false},
+		{transport.H3, 1, true, 1, true},
+		{transport.H3, 1, true, 2, false},
+		{transport.H3, 1, false, 1, true}, // failed Probe, passive server migration
+		{transport.H3, 1, false, 2, true},
+		{transport.H3, 1, false, 3, false},
 	}
 	for _, c := range cases {
-		if got := ExpectedDials(c.t, c.migrations, c.migrated); got != c.want {
-			t.Errorf("(%s,%d,%v) = %d, want %d", c.t, c.migrations, c.migrated, got, c.want)
+		if got := DialsValid(c.t, c.migrations, c.migrated, c.dials); got != c.want {
+			t.Errorf("(%s,%d,%v,%d) = %v, want %v", c.t, c.migrations, c.migrated, c.dials, got, c.want)
 		}
 	}
 }

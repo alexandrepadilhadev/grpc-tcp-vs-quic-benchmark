@@ -24,6 +24,7 @@ type Meta struct {
 	Dials          int64             `json:"dials"`
 	Migrations     int               `json:"migrations"` // client IP changes done (s4)
 	MigrateTo      string            `json:"migrate_to,omitempty"`
+	MigrateAtNs    int64             `json:"migrate_at_ns,omitempty"`
 	Total          int64             `json:"total"`
 	OK             int64             `json:"ok"`
 	Errors         map[string]int64  `json:"errors"`

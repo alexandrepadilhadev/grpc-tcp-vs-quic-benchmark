@@ -380,7 +380,7 @@ func TestMigrateRun(t *testing.T) {
 			if tr == transport.H2 {
 				wantDials = 2
 			}
-			if m.Migrations != 1 || m.MigrateTo != "127.0.0.2" || m.Dials != wantDials || !m.TransportCfg.Migratable || m.OK == 0 {
+			if m.Migrations != 1 || m.MigrateTo != "127.0.0.2" || m.MigrateAtNs != 1000000000 || m.Dials != wantDials || !m.TransportCfg.Migratable || m.OK == 0 {
 				t.Fatalf("meta = %+v", m)
 			}
 		})
