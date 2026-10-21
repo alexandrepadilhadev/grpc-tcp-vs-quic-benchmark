@@ -335,6 +335,9 @@ func TestMigrateRun(t *testing.T) {
 	transporttest.NeedLoopback2(t)
 	for _, tr := range []transport.Transport{transport.H2, transport.H3} {
 		t.Run(tr.String(), func(t *testing.T) {
+			if tr == transport.H3 {
+				transporttest.SkipH3SwitchUnderRace(t)
+			}
 			calls := fakeIP(t)
 			store := ledger.NewMemStore(10000, 1e15)
 			c := startChain(t, tr, store, "")

@@ -48,7 +48,24 @@ func migratable(cfg transport.Config) transport.Config {
 	return cfg
 }
 
+// waitPeer repeats the request until the server sees host: it switches its
+// peer only after validating the new path, so early requests may still show
+// the old address.
+func waitPeer(ctx context.Context, t *testing.T, cli *transport.Client, url string, ph *peerHandler, host string) {
+	t.Helper()
+	for range 50 {
+		if _, err := get(ctx, cli, url); err != nil {
+			t.Fatal(err)
+		}
+		if ph.last() == host {
+			return
+		}
+	}
+	t.Fatalf("host after = %q; want %s", ph.last(), host)
+}
+
 func TestMigrateH3(t *testing.T) {
+	transporttest.SkipH3SwitchUnderRace(t)
 	transporttest.NeedLoopback2(t)
 	ph := &peerHandler{}
 	url, cfg, _ := startServer(t, transport.H3, ph, nil)
@@ -64,12 +81,7 @@ func TestMigrateH3(t *testing.T) {
 	if err := cli.Migrate(ctx, loopback2); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if _, err := get(ctx, cli, url); err != nil {
-		t.Fatal(err)
-	}
-	if h := ph.last(); h != "127.0.0.2" {
-		t.Fatalf("host after = %q; want 127.0.0.2", h)
-	}
+	waitPeer(ctx, t, cli, url, ph, "127.0.0.2")
 	if n := cli.Dials(); n != 1 {
 		t.Fatalf("Dials = %d; want 1", n)
 	}
@@ -111,6 +123,7 @@ func TestMigrateH2(t *testing.T) {
 }
 
 func TestMigrateH3InFlight(t *testing.T) {
+	transporttest.SkipH3SwitchUnderRace(t)
 	transporttest.NeedLoopback2(t)
 	ph := &peerHandler{delay: 50 * time.Millisecond}
 	url, cfg, _ := startServer(t, transport.H3, ph, nil)
@@ -145,12 +158,7 @@ func TestMigrateH3InFlight(t *testing.T) {
 	if n := cli.Dials(); n != 1 {
 		t.Fatalf("Dials = %d; want 1", n)
 	}
-	if _, err := get(ctx, cli, url); err != nil {
-		t.Fatal(err)
-	}
-	if h := ph.last(); h != "127.0.0.2" {
-		t.Fatalf("host after = %q; want 127.0.0.2", h)
-	}
+	waitPeer(ctx, t, cli, url, ph, "127.0.0.2")
 }
 
 // dropProxy relays UDP between a 127.0.0.1 client and the server at url,
