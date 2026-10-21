@@ -156,6 +156,8 @@ services:
       TLS_CA: /certs/ca.crt
       LOG_LEVEL: ${LOG_LEVEL:-info}
     cap_add: [NET_ADMIN]
+    # without it, removing the primary IP also removes the secondary in the same subnet
+    sysctls: {net.ipv4.conf.all.promote_secondaries: "1"}
     cpuset: "${LOADGEN_CPUS:-1}"
     volumes: ["../certs:/certs:ro", "../results:/results"]
     networks: [rpcnet]
@@ -176,7 +178,8 @@ networks:
   rpcnet:
     driver: bridge
     ipam:
-      config: [{subnet: 10.10.0.0/24}]
+      # 10.10.0.128+ reserved for s4's --migrate-to
+      config: [{subnet: 10.10.0.0/24, ip_range: 10.10.0.0/25}]
   datanet:
     driver: bridge
     ipam:
