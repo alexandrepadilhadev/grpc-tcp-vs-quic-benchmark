@@ -11,34 +11,138 @@ x-netem: &netem
   NETEM_JITTER: ${NETEM_JITTER:-0}
   NETEM_DIST: ${NETEM_DIST:-normal}
   NETEM_LOSS: ${NETEM_LOSS:-0}
+  NETEM_SUBNET: ${NETEM_SUBNET:-10.10.0.0/24} # netem only on the rpcnet interface
   QLOGDIR: ${QLOGDIR:-} # set by run.sh with QLOG=1; empty = no QUIC tracing
 
+# gRPC services (gateway, core, ledger): server + clients on one TRANSPORT
+x-grpc-env: &grpc-env
+  <<: *netem
+  TRANSPORT: ${TRANSPORT:-h2}
+  ADDR: ":8443"
+  TLS_CERT: /certs/server.crt
+  TLS_KEY: /certs/server.key
+  TLS_CA: /certs/ca.crt
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  REP_DIR: ${REP_DIR:-} # svc-<name>.json at shutdown; set by run.sh
+
+x-grpc: &grpc
+  image: bench-services:local
+  expose: ["8443/tcp", "8443/udp"]
+  cap_add: [NET_ADMIN]
+  volumes: ["../certs:/certs:ro", "../results:/results"]
+  stop_grace_period: 15s # shutdown (<= 10 s) then the report
+
+x-health: &health
+  start_period: 10s
+  start_interval: 1s
+  interval: 60s
+  timeout: 3s
+  retries: 3
+
 services:
-  server:
+  gateway:
+    <<: *grpc
     build:
       <<: *build
-      target: server
-    image: bench-server:local
-    expose: ["8443/tcp", "8443/udp"]
+      target: services
+    command: ["/usr/local/bin/gateway"]
     environment:
-      <<: *netem
-      TRANSPORT: ${TRANSPORT:-h2}
-      ADDR: ":8443"
-      TLS_CERT: /certs/server.crt
-      TLS_KEY: /certs/server.key
-      TLS_CA: /certs/ca.crt
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-    cap_add: [NET_ADMIN]
-    cpuset: "${SERVER_CPUS:-2-3}"
-    volumes: ["../certs:/certs:ro", "../results:/results"]
-    networks: [benchnet]
+      <<: *grpc-env
+      CORE_ADDR: core:8443
+    cpuset: "${GATEWAY_CPUS:-2}"
+    networks: [rpcnet]
     healthcheck:
-      test: ["CMD", "/usr/local/bin/server", "healthcheck"]
-      start_period: 10s
-      start_interval: 1s
-      interval: 60s
-      timeout: 3s
-      retries: 3
+      <<: *health
+      test: ["CMD", "/usr/local/bin/gateway", "healthcheck"]
+    depends_on:
+      core:
+        condition: service_healthy
+
+  core:
+    <<: *grpc
+    command: ["/usr/local/bin/core"]
+    environment:
+      <<: *grpc-env
+      # ledger-rpc exists only on rpcnet: "ledger" may resolve to datanet and skip netem
+      LEDGER_ADDR: ledger-rpc:8443
+      AMQP_URL: amqp://bench:bench@rabbitmq:5672/
+      ACQUIRER_DELAY: ${ACQUIRER_DELAY:-0s}
+    cpuset: "${CORE_CPUS:-3}"
+    networks: [rpcnet, datanet]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "/usr/local/bin/core", "healthcheck"]
+    depends_on:
+      ledger:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  ledger:
+    <<: *grpc
+    command: ["/usr/local/bin/ledger"]
+    environment:
+      <<: *grpc-env
+      DATABASE_URL: postgres://postgres:bench@postgres:5432/postgres
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-8}
+    cpuset: "${LEDGER_CPUS:-4}"
+    networks:
+      rpcnet:
+        aliases: [ledger-rpc]
+      datanet: {}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "/usr/local/bin/ledger", "healthcheck"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  risk:
+    image: bench-services:local
+    command: ["/usr/local/bin/risk"]
+    environment:
+      AMQP_URL: amqp://bench:bench@rabbitmq:5672/
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      REP_DIR: ${REP_DIR:-}
+    volumes: ["../results:/results"]
+    stop_grace_period: 15s
+    cpuset: "${DATA_CPUS:-5}"
+    networks: [datanet]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  rabbitmq:
+    image: rabbitmq:4.3.6 # no management plugin: its stats would share CPU 5
+    environment:
+      RABBITMQ_DEFAULT_USER: bench
+      RABBITMQ_DEFAULT_PASS: bench
+      # one scheduler and no busy-wait on the shared CPU (spec §7.2)
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 1:1 +sbwt none +sbwtdcpu none +sbwtdio none"
+    cpuset: "${DATA_CPUS:-5}"
+    networks: [datanet]
+    healthcheck:
+      <<: *health
+      start_period: 60s
+      timeout: 10s
+      # health only gates startup: a rare probe keeps the Erlang CLI off CPU 5 during runs
+      interval: 1h
+      # listeners accept TCP (ping answers before the AMQP port and user exist)
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+
+  postgres:
+    image: postgres:18.6-trixie
+    environment:
+      POSTGRES_PASSWORD: bench
+    # no fsync wait per commit: the VM disk stays out of the measured path (spec §2)
+    command: ["postgres", "-c", "synchronous_commit=off", "-c", "max_connections=50", "-c", "shared_buffers=256MB"]
+    volumes: ["./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    cpuset: "${DATA_CPUS:-5}"
+    networks: [datanet]
+    healthcheck:
+      <<: *health
+      # over TCP: the init server (running init.sql) listens on the socket only
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
 
   loadgen:
     build:
@@ -50,12 +154,15 @@ services:
       <<: *netem
       TRANSPORT: ${TRANSPORT:-h2}
       TLS_CA: /certs/ca.crt
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     cap_add: [NET_ADMIN]
-    cpuset: "${LOADGEN_CPUS:-4-5}"
+    # without it, removing the primary IP also removes the secondary in the same subnet
+    sysctls: {net.ipv4.conf.all.promote_secondaries: "1"}
+    cpuset: "${LOADGEN_CPUS:-1}"
     volumes: ["../certs:/certs:ro", "../results:/results"]
-    networks: [benchnet]
+    networks: [rpcnet]
     depends_on:
-      server:
+      gateway:
         condition: service_healthy
 
   analysis:
@@ -68,5 +175,12 @@ services:
     volumes: ["../results:/results"]
 
 networks:
-  benchnet:
+  rpcnet:
     driver: bridge
+    ipam:
+      # 10.10.0.128+ reserved for s4's --migrate-to
+      config: [{subnet: 10.10.0.0/24, ip_range: 10.10.0.0/25}]
+  datanet:
+    driver: bridge
+    ipam:
+      config: [{subnet: 10.20.0.0/24}]

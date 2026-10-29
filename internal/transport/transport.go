@@ -20,6 +20,8 @@ var (
 	ErrInvalidConfig    = errors.New("transport: invalid config")
 	ErrTLSConfig        = errors.New("transport: tls config")
 	ErrProtoMismatch    = errors.New("transport: protocol mismatch")
+	ErrNotMigratable    = errors.New("transport: client not migratable")
+	ErrNoConnection     = errors.New("transport: no connection to migrate")
 )
 
 // Parse validates s and returns the matching Transport.

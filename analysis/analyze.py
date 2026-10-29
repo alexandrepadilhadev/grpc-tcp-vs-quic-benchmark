@@ -18,13 +18,17 @@ from scipy import stats  # noqa: E402
 
 NS = 1_000_000_000
 KEYS = ["scenario", "transport"]
-ID = ["run", "rep", "excluded"]  # reps.csv columns that are not metrics
+ID = ["run", "rep", "excluded", "cpu_outlier"]  # reps.csv columns that are not metrics
 QUANTILES = np.linspace(0, 100, 1001)
 COLORS = {"h2": "#2a78d6", "h3": "#eb6834"}  # dataviz categorical slots 1-2, validated (light)
 COMPARE = [
     "p50", "p99", "p999", "p50_all", "p99_all", "p999_all", "error_rate", "ok_rps", "served_frac", "recovery_s", "cpu_per_krps", "handshake_ms",
+    "orphans", "orphan_share", "interrupt_ms", "gap_base_ms", "migration_errors", "migrate_ms",
 ]
 RATIO = {"ok_rps", "served_frac"}  # throughput metrics: comparison also reports h3/h2 with a CI
+RPC_SERVICES = ["gateway", "core", "ledger"]  # the gRPC services whose CPU makes rpc_cpu
+SVC_REPORTS = ["gateway", "core", "ledger", "risk"]  # svc-<name>.json each payment repetition must have
+CPU_OUTLIER_MIN = 0.20  # cpu_outlier also needs +20% over the median (host noise seen: 2.3x)
 INK, MUTED, GRID = "#1a1a19", "#6b6a63", "#e4e3dc"
 MIB = {"B": 1 / 2**20, "KiB": 1 / 2**10, "MiB": 1.0, "GiB": 2**10, "TiB": 2**20}
 
@@ -378,6 +382,127 @@ def plot_outage(series, path):
     _save(fig, path)
 
 
+def hop_problems(d) -> list[str]:
+    """Why the per-hop reports of a payment repetition invalidate it: a missing or
+    unreadable svc-<name>.json, or a hop that did not use exactly one connection.
+    POC repetitions (no svc-*.json at all) have none."""
+    if not any(d.glob("svc-*.json")):
+        return []
+    bad = []
+    for svc in SVC_REPORTS:
+        f = d / f"svc-{svc}.json"
+        if not f.exists():
+            bad.append(f"{f.name} missing")
+            continue
+        try:
+            dials = json.loads(f.read_text())["dials"].items()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            bad.append(f"{f.name} unreadable")
+            continue
+        bad += [f"{f.name} {peer} dials={n}" for peer, n in dials if n != 1]
+    return bad
+
+
+def cpu_outlier(reps: pd.DataFrame) -> pd.Series:
+    """True for reps whose cpu_per_krps is above the median + 3 MAD of their run x scenario x
+    transport and at least CPU_OUTLIER_MIN above the median: host noise makes the same load
+    cost more CPU without lowering the throughput, which degraded_s cannot see. The floor keeps
+    a very stable group (tiny MAD) from flagging a few percent. MAD 0 (or no CPU data) flags nothing."""
+    if "cpu_per_krps" not in reps:
+        return pd.Series(False, index=reps.index)
+
+    def flag(x):
+        med = x.median()
+        mad = (x - med).abs().median()
+        if not mad > 0:
+            return pd.Series(False, index=x.index)
+        return (x > med + 3 * mad) & (x > med * (1 + CPU_OUTLIER_MIN))
+
+    return reps.groupby(["run"] + KEYS, group_keys=False).cpu_per_krps.apply(flag).reindex(reps.index).astype(bool)
+
+
+def orphans(d) -> dict:
+    """Payments the ledger settled while the client saw an error: the ledger's committed
+    count minus the RPCs answered ok (every phase, plus the probe). orphan_share divides by
+    the failed RPCs (NaN without failures). Empty without the ledger counter (older runs)."""
+    try:
+        settled = json.loads((d / "svc-ledger.json").read_text())["counters"]["settled"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    status = pd.read_csv(d / "requests.csv", usecols=["status"]).status
+    ok = int((status == "ok").sum())
+    failed = len(status) - ok
+    n = settled - ok - 1  # 1: the probe, answered ok and not in requests.csv
+    return {"orphans": n, "orphan_share": n / failed if failed else np.nan}
+
+
+def read_events(d) -> pd.Series | None:
+    """ts_ns of events.csv indexed by event name; None when the rep has no events.csv."""
+    f = d / "events.csv"
+    return pd.read_csv(f).set_index("event")["ts_ns"] if f.exists() else None
+
+
+def valid_dials(meta, events) -> set[int]:
+    """Client dials accepted for a rep (s4 spec §7.1): h2 redials on every migration; h3 keeps
+    1 when migrated, and after a failed Probe either redials or survives by passive server migration."""
+    n = meta.get("migrations", 0)
+    if n == 0:
+        return {1}
+    if meta.get("transport") != "h3":
+        return {1 + n}
+    if events is not None and "migrated" in events.index:
+        return {1}
+    return {1, 1 + n}
+
+
+def peer_problems(d, meta) -> list[str]:
+    """Why a migration rep is invalid: the gateway has not seen migrate_to plus another client IP."""
+    if meta.get("migrations", 0) <= 0:
+        return []
+    try:
+        peers = json.loads((d / "svc-gateway.json").read_text())["peers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        peers = {}
+    if meta.get("migrate_to") not in peers or len(peers) < 2:
+        return ["migration not seen by the gateway"]
+    return []
+
+
+def max_gap_ms(df, lo_ns, hi_ns) -> float:
+    """Largest gap in ms between consecutive ok completions inside [lo, hi]; lo and hi count
+    as completions, so a window without ok gives hi - lo."""
+    done = df.start_ns + df.latency_us * 1000
+    t = np.sort(done[(df.status == "ok") & (done > lo_ns) & (done < hi_ns)].to_numpy(dtype="int64"))
+    return float(np.diff(np.concatenate([[lo_ns], t, [hi_ns]])).max() / 1e6)
+
+
+def migration_metrics(df, events, meta, name="") -> dict:
+    """s4 interruption metrics (spec §7.2) around t_m = migrate_start: interrupt_ms, the largest
+    ok gap in [t_m - 1 s, t_m + 5 s]; gap_base_ms, the same in [t_m - 11 s, t_m - 5 s];
+    migration_errors, failed RPCs completing in the first window; migrate_ms, migrate_start to
+    migrated/migrate_failed; migrated, 1 when h3 kept its single connection. A windowed metric is NaN (with a warning)
+    when its window is not inside the measured span [first, last measure start]."""
+    t_m = int(events["migrate_start"])
+    lo, hi = t_m - NS, t_m + 5 * NS
+    span = df.start_ns.min(), df.start_ns.max()
+
+    def inside(metric, a, b):
+        if span[0] <= a and b <= span[1]:
+            return True
+        _warn(f"{name}: {metric} window outside the measure phase, left empty")
+        return False
+
+    done = df.start_ns + df.latency_us * 1000
+    end = events["migrated" if "migrated" in events.index else "migrate_failed"]
+    return {
+        "interrupt_ms": max_gap_ms(df, lo, hi) if inside("interrupt_ms", lo, hi) else np.nan,
+        "gap_base_ms": max_gap_ms(df, t_m - 11 * NS, t_m - 5 * NS) if inside("gap_base_ms", t_m - 11 * NS, t_m - 5 * NS) else np.nan,
+        "migration_errors": int(((df.status != "ok") & done.between(lo, hi)).sum()) if inside("migration_errors", lo, hi) else np.nan,
+        "migrate_ms": (end - t_m) / 1e6,
+        "migrated": int("migrated" in events.index and meta.get("dials") == 1),
+    }
+
+
 def _rep_row(d, name):
     """Metrics of one repetition dir, or None when it is not valid."""
     meta_path = d / "meta.json"
@@ -388,8 +513,23 @@ def _rep_row(d, name):
     if meta.get("interrupted"):
         _warn(f"{name}: interrupted, skipped")
         return None
-    if meta.get("dials") != 1:  # spec §9: more than one connection invalidates the rep
-        _warn(f"{name}: dials={meta.get('dials')}, skipped")
+    try:
+        events = read_events(d)
+    except (ValueError, KeyError, pd.errors.EmptyDataError):
+        _warn(f"{name}: events.csv unreadable, skipped")
+        return None
+    if meta.get("migrations", 0) > 0 and (events is None or "migrate_start" not in events.index):
+        _warn(f"{name}: migrations={meta['migrations']} but no migrate_start in events.csv, skipped")
+        return None
+    if events is not None and "migrate_start" in events.index and not {"migrated", "migrate_failed"} & set(events.index):
+        _warn(f"{name}: migrate_start without migrated/migrate_failed in events.csv, skipped")
+        return None
+    want = valid_dials(meta, events)
+    if meta.get("dials") not in want:  # spec §9 / s4 §7.1
+        _warn(f"{name}: dials={meta.get('dials')}, expected {' or '.join(map(str, sorted(want)))}, skipped")
+        return None
+    for problem in hop_problems(d) + peer_problems(d, meta):  # the same rule on every internal hop (payment spec §10)
+        _warn(f"{name}: {problem}, skipped")
         return None
     df = load_requests(d / "requests.csv")
     if not (df.status == "ok").any():
@@ -404,11 +544,15 @@ def _rep_row(d, name):
     row.update(throughput(df))
     row["error_rate"] = error_rate(df)
     row["served_frac"] = served_frac(meta)
+    row.update(orphans(d))
     if (d / "stats.csv").exists():
         end = df.start_ns + df.latency_us * 1000
         row.update(_container_stats(d / "stats.csv", df.start_ns.min(), end.max()))
-        if "server_cpu" in row:
-            row["cpu_per_krps"] = row["server_cpu"] / (row["ok_rps"] / 1000)
+        if all(f"{c}_cpu" in row for c in RPC_SERVICES):
+            row["rpc_cpu"] = sum(row[f"{c}_cpu"] for c in RPC_SERVICES)
+        cpu = row.get("rpc_cpu", row.get("server_cpu"))  # payment system, else the POC server
+        if cpu is not None:
+            row["cpu_per_krps"] = cpu / (row["ok_rps"] / 1000)
     else:
         _warn(f"{name}: no stats.csv")
     return row, df, meta
@@ -431,8 +575,11 @@ def _scan(run):
         row, df, meta = got
         rps = meta.get("load", {}).get("rps", 0)
         s, exclude, entry = throughput_series(df), None, None
-        if (d / "events.csv").exists():
-            ev = pd.read_csv(d / "events.csv").set_index("event").ts_ns
+        ev = read_events(d)
+        if ev is not None and "migrate_start" in ev.index:
+            row.update(migration_metrics(df, ev, meta, name))
+            exclude = (ev.migrate_start - NS, ev.migrate_start + 5 * NS)
+        elif ev is not None and "outage_start" in ev.index:
             s = throughput_series(df, origin=ev.outage_end)
             rec = recovery_time(s, ev.outage_start, ev.outage_end)
             if rec is None:
@@ -456,7 +603,7 @@ def _args(argv):
     p.add_argument("--out", type=Path, help="output dir (default <run>/analysis; required with several runs)")
     p.add_argument(
         "--exclude-degraded", default="", metavar="SCENARIO,...",
-        help="drop reps with degraded_s > 0 in these scenarios (host noise; only without injected loss or jitter)",
+        help="drop reps with degraded_s > 0 or cpu_outlier in these scenarios (host noise; only without injected loss or jitter)",
     )
     try:
         args = p.parse_args(argv)
@@ -472,7 +619,8 @@ def _check_runs(found):
     seen = {}
     for row, _, _, meta in found:
         s = seen.setdefault(row["scenario"], {"load": set(), "commit": set()})
-        s["load"].add(json.dumps(meta.get("load"), sort_keys=True))
+        load = {"load": meta.get("load"), "migrate_at_ns": meta.get("migrate_at_ns"), "migrate_to": meta.get("migrate_to")}
+        s["load"].add(json.dumps(load, sort_keys=True))
         s["commit"].add(meta.get("version"))
     for scenario, s in seen.items():
         for what, values in s.items():
@@ -496,11 +644,14 @@ def main(argv: list[str]) -> int:
     _check_runs(found)
 
     reps = pd.DataFrame([row for row, _, _, _ in found])
+    reps["cpu_outlier"] = cpu_outlier(reps)
+    for r in reps[reps.cpu_outlier].itertuples():
+        _warn(f"{r.scenario}/{r.transport}/rep-{r.rep}: cpu_outlier (cpu_per_krps={r.cpu_per_krps:.1f}, run {r.run})")
     noisy = {s for s in args.exclude_degraded.split(",") if s}
-    reps["excluded"] = reps.scenario.isin(noisy) & (reps.degraded_s > 0)
+    reps["excluded"] = reps.scenario.isin(noisy) & ((reps.degraded_s > 0) | reps.cpu_outlier)
     n_excluded = reps.groupby(KEYS).excluded.sum()
     for (scenario, transport), n in n_excluded[n_excluded > 0].items():
-        _warn(f"{scenario}/{transport}: {n} rep(s) excluded (degraded_s > 0)")
+        _warn(f"{scenario}/{transport}: {n} rep(s) excluded (degraded_s > 0 or cpu_outlier)")
     kept = reps[~reps.excluded]
     curves, series = {}, []
     for (row, curve, entry, _), excluded in zip(found, reps.excluded):

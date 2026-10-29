@@ -3,7 +3,14 @@
 # Usage: netem.sh apply | clear | outage <seconds> | run <cmd...>
 set -eu
 
-IFACE=${NETEM_IFACE:-eth0}
+# NETEM_SUBNET picks the interface with an address in that subnet (the gRPC
+# network); without it, NETEM_IFACE (default eth0).
+if [ -n "${NETEM_SUBNET:-}" ]; then
+	IFACE=$(ip -o -4 addr show to "$NETEM_SUBNET" | awk '{sub(/@.*/, "", $2); print $2; exit}')
+	[ -n "$IFACE" ] || { echo "netem: no interface in $NETEM_SUBNET" >&2; exit 1; }
+else
+	IFACE=${NETEM_IFACE:-eth0}
+fi
 
 clear_qdisc() {
 	tc qdisc del dev "$IFACE" root 2>/dev/null || true

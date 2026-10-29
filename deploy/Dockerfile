@@ -10,9 +10,9 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
 COPY --chmod=755 deploy/netem.sh /usr/local/bin/netem.sh
 
-FROM runtime AS server
-COPY --from=build /out/server /usr/local/bin/server
-ENTRYPOINT ["/usr/local/bin/netem.sh", "run", "/usr/local/bin/server"]
+FROM runtime AS services
+COPY --from=build /out/gateway /out/core /out/ledger /out/risk /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/netem.sh", "run"]
 
 FROM runtime AS loadgen
 COPY --from=build /out/loadgen /usr/local/bin/loadgen
